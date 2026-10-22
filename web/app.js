@@ -74,6 +74,17 @@
   const safeColor = (value) =>
     /^#[0-9a-fA-F]{6}$/.test(String(value || "")) ? value : "#5b7165";
 
+  const NAME_NOISE_RE = /[\u00ad\u200b-\u200f\u2060\ufeff]/g;
+  const NAME_BRACKET_SPACE_RE = /\s*([()[\]])\s*/g;
+  function canonicalSoftwareName(value) {
+    return String(value == null ? "" : value)
+      .normalize("NFKC")
+      .replace(NAME_NOISE_RE, "")
+      .replace(NAME_BRACKET_SPACE_RE, "$1")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function icon(name, className = "ico") {
     return `<svg class="${className}" aria-hidden="true"><use href="#${name}"></use></svg>`;
   }
@@ -823,9 +834,11 @@
       confirm: isForce ? "开始扫描残留" : "开始卸载",
       danger: false,
       onConfirm: async () => {
+        let forceName = "";
         if (isForce) {
           const input = $("forceConfirmName");
-          if (!input || input.value.trim() !== String(app.name).trim()) {
+          forceName = input ? input.value : "";
+          if (!input || canonicalSoftwareName(forceName) !== canonicalSoftwareName(app.name)) {
             toast("请输入完整的软件名称", "error");
             return false;
           }
@@ -835,7 +848,7 @@
           body: {
             app_id: app.id,
             mode,
-            confirm_name: isForce ? (($("forceConfirmName") || {}).value || "") : "",
+            confirm_name: isForce ? forceName : "",
           },
         });
         if (!result.job) throw new Error("任务创建失败");
@@ -859,7 +872,8 @@
       if (input && button) {
         button.disabled = true;
         input.addEventListener("input", () => {
-          button.disabled = input.value.trim() !== String(app.name).trim();
+          button.disabled =
+            canonicalSoftwareName(input.value) !== canonicalSoftwareName(app.name);
         });
         setTimeout(() => input.focus(), 60);
       }
@@ -1178,7 +1192,7 @@
       ${permanent
         ? `<div class="confirm-warning danger"><strong>永久删除不可恢复。</strong>所选目录和文件将直接绕过回收站删除，无法撤销。请只在确认这些内容不再需要时继续。</div>
            <div class="field"><label for="permanentNameInput">输入软件名称以确认</label>
-             <input class="input" id="permanentNameInput" type="text" autocomplete="off" spellcheck="false" placeholder="${esc(job.app_name)}">
+             <input class="input" id="permanentNameInput" type="text" autocomplete="off" spellcheck="false" placeholder="${esc(job.app_name)}" ${state.cleanupSubmitting ? "disabled" : ""}>
              <p class="field-hint">请输入 <code>${esc(job.app_name)}</code>。注册表项也会先备份，但文件不会进入回收站。</p>
            </div>`
         : `<div class="confirm-warning">这些项目将移动到 Windows 回收站，必要时可以恢复。仍建议确认列表中没有需要的聊天记录、浏览器配置或项目文件。</div>`}
@@ -1281,13 +1295,15 @@
     const permanentInput = $("permanentNameInput");
     if (permanentInput) {
       const confirmButton = root.querySelector('[data-act="cleanup-confirm"]');
+      const expectedName = canonicalSoftwareName(job.confirm_name || job.app_name);
       if (confirmButton) confirmButton.disabled = true;
       permanentInput.addEventListener("input", () => {
         if (confirmButton) {
-          confirmButton.disabled = permanentInput.value.trim() !== String(job.app_name || "").trim();
+          confirmButton.disabled = !expectedName ||
+            canonicalSoftwareName(permanentInput.value) !== expectedName;
         }
       });
-      setTimeout(() => permanentInput.focus(), 60);
+      if (!state.cleanupSubmitting) setTimeout(() => permanentInput.focus(), 60);
     }
     renderMiniJob();
   }
@@ -1345,21 +1361,30 @@
     const items = (job.leftover && job.leftover.items) || [];
     const ids = items.filter((item) => state.jobSelection.has(item.id)).map((item) => item.id);
     if (!ids.length) return toast("请至少选择一个项目", "error");
+    // Capture the typed name BEFORE re-rendering. renderJobModal() rebuilds the
+    // dialog and would otherwise replace the input with an empty one, causing
+    // the server to receive "" and reject an already validated confirmation.
+    let confirmName = "";
     if (permanent) {
       const input = $("permanentNameInput");
-      if (!input || input.value.trim() !== String(job.app_name || "").trim()) {
+      confirmName = input ? input.value : "";
+      const expectedName = canonicalSoftwareName(job.confirm_name || job.app_name);
+      if (!input || !expectedName ||
+          canonicalSoftwareName(confirmName) !== expectedName) {
         return toast("请完整输入软件名称", "error");
       }
     }
     state.cleanupSubmitting = true;
     renderJobModal(true);
+    const submittingInput = permanent ? $("permanentNameInput") : null;
+    if (submittingInput) submittingInput.value = confirmName;
     try {
       const result = await api(`/api/jobs/${encodeURIComponent(job.id)}/cleanup`, {
         method: "POST",
         body: {
           item_ids: ids,
           permanent: Boolean(permanent),
-          confirm_name: permanent ? (($("permanentNameInput") || {}).value || "") : "",
+          confirm_name: confirmName,
         },
       });
       state.cleanupSubmitting = false;

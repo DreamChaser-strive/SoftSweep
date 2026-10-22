@@ -238,6 +238,94 @@ def test_job_cleanup_and_recovery() -> None:
         wu.LOG_DIR = old_log_dir
 
 
+def test_name_confirmation() -> None:
+    """Permanent deletion must accept a visibly identical typed name."""
+    display_name = "Antigravity IDE (User)"
+    canonical = job_engine.normalize_software_name(display_name)
+    variants = [
+        display_name,
+        "  " + display_name + "  ",
+        "Antigravity\u00a0IDE（User）",
+        "Ａｎｔｉｇｒａｖｉｔｙ　IDE (User)",
+        "Antigravity  IDE\t(User)\u200b",
+        "Antigravity IDE(User)",
+    ]
+    for variant in variants:
+        check(job_engine.normalize_software_name(variant) == canonical,
+              f"名称规范化：{variant!r}", job_engine.normalize_software_name(variant))
+    check(job_engine.normalize_software_name("Antigravity IDE") != canonical,
+          "不同名称不会被误判为一致")
+    check(job_engine.normalize_software_name("antigravity ide (user)") != canonical,
+          "名称确认区分大小写")
+
+    target = TEST_ROOT / "job_name_confirm"
+    restored_target = TEST_ROOT / "job_name_restored"
+    for directory in (target, restored_target):
+        directory.mkdir(parents=True, exist_ok=False)
+        (directory / "payload.txt").write_text("softsweep", encoding="utf-8")
+
+    old_backup_dir = wu.BACKUP_DIR
+    old_log_dir = wu.LOG_DIR
+    wu.BACKUP_DIR = TEST_ROOT / "name-backups"
+    wu.LOG_DIR = TEST_ROOT / "name-reports"
+    state_dir = TEST_ROOT / "name-state"
+    try:
+        manager = job_engine.JobsManager(state_dir)
+        job = make_test_job(display_name, manager)
+        job.status = "awaiting_cleanup"
+        job.leftover = make_leftover(target, "test-name")
+        check(job.snapshot().get("confirm_name") == display_name,
+              "任务快照提供独立的确认名称")
+
+        partial = job.cleanup(["test-name"], permanent=True, confirm_name="Antigravity IDE")
+        check(not partial.get("ok") and target.exists(),
+              "不完整名称仍会被拒绝", str(partial))
+
+        accepted = job.cleanup(
+            ["test-name"], permanent=True,
+            confirm_name=" Antigravity\u00a0IDE（User）\u200b ",
+        )
+        check(accepted.get("ok") and not target.exists(),
+              "全角括号/空格差异可完成永久删除", str(accepted))
+
+        restored_job = make_test_job(display_name, manager)
+        restored_job.status = "awaiting_cleanup"
+        restored_job.leftover = make_leftover(restored_target, "test-name-restored")
+        restored_job._persist()
+
+        recovered_manager = job_engine.JobsManager(state_dir)
+        recovered_manager.restore_saved()
+        recovered = recovered_manager.get(restored_job.id)
+        check(bool(recovered) and recovered.confirm_name == display_name,
+              "恢复任务保留确认名称")
+        check(bool(recovered) and recovered.snapshot().get("confirm_name") == display_name,
+              "恢复任务快照提供确认名称")
+        restored_ok = recovered.cleanup(
+            ["test-name-restored"], permanent=True,
+            confirm_name="Antigravity\u00a0IDE（User）",
+        ) if recovered else {"ok": False}
+        check(restored_ok.get("ok") and not restored_target.exists(),
+              "恢复任务也可用规范化名称永久删除", str(restored_ok))
+    finally:
+        wu.BACKUP_DIR = old_backup_dir
+        wu.LOG_DIR = old_log_dir
+
+
+def test_cleanup_confirm_frontend() -> None:
+    """The dialog must keep the typed name when it re-renders for submission."""
+    source = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    start = source.index("async function doCleanup(")
+    end = source.index("async function jobAction(", start)
+    block = source[start:end]
+    check("let confirmName" in block, "确认弹窗在重绘前读取输入名称")
+    check("confirm_name: confirmName" in block, "提交时使用已保存的确认名称")
+    check('($("permanentNameInput") || {}).value' not in block,
+          "提交时不再从重绘后的空输入框读取名称")
+    check(block.index("let confirmName") < block.index("renderJobModal(true)"),
+          "读取名称发生在弹窗重绘之前")
+    check("canonicalSoftwareName" in source, "前端使用统一的名称规范化函数")
+
+
 def test_icon_boundaries() -> None:
     check(icons.valid_app_id("a0123456789abcdef"), "接受合法应用 ID")
     for bad in ("", "../x", "a0123", "j0123456789abcdef", "u0123456789ABCDEF", "../../a0123456789abcdef"):
@@ -359,6 +447,8 @@ def main() -> int:
         test_recycle_and_permanent()
         test_registry()
         test_job_cleanup_and_recovery()
+        test_name_confirmation()
+        test_cleanup_confirm_frontend()
         test_store_app_size_and_publisher()
         test_size_probe_safety()
         test_icon_boundaries()

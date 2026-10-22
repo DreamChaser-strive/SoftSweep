@@ -24,7 +24,7 @@ from core import winutil as wu
 from core.jobs import JOBS
 from core.scanner import SCANNER
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 INSTANCE_MUTEX_NAME = "Local\\SoftSweep.SingleInstance.9D4A2B6F"
 ERROR_ALREADY_EXISTS = 183
 WEB_DIR = wu.APP_DIR / "web"
@@ -54,7 +54,7 @@ class AppServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SoftSweep/1.2"
+    server_version = "SoftSweep/1.2.1"
     sys_version = ""
 
     # ------------------------------------------------------------- utilities

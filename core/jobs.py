@@ -18,6 +18,7 @@ import subprocess
 import threading
 import time
 import traceback
+import unicodedata
 import uuid
 import winreg
 from datetime import datetime
@@ -48,6 +49,24 @@ STATUS_LABELS = {
 
 def _now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+_NAME_NOISE_RE = re.compile(r"[\u00ad\u200b-\u200f\u2060\ufeff]")
+_NAME_BRACKET_SPACE_RE = re.compile(r"\s*([()\[\]])\s*")
+
+
+def normalize_software_name(value: object) -> str:
+    """Canonical form used to confirm a destructive cleanup.
+
+    The displayed name may contain full-width punctuation, a non-breaking
+    space or an invisible zero-width character.  Users cannot reasonably
+    reproduce those by hand, so compare a normalised form instead of raw
+    bytes.  Case is intentionally preserved.
+    """
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = _NAME_NOISE_RE.sub("", text)
+    text = _NAME_BRACKET_SPACE_RE.sub(r"\1", text)
+    return " ".join(text.split())
 
 
 def _key_exists(path: str) -> bool:
@@ -132,6 +151,7 @@ class Job:
     def __init__(self, app: dict, mode: str, jobs: "JobsManager"):
         self.id = "j" + uuid.uuid4().hex[:16]
         self.app = copy.deepcopy(app)
+        self.confirm_name = str(self.app.get("name") or "")
         self.mode = mode
         self.jobs = jobs
         self.lock = threading.RLock()
@@ -191,7 +211,8 @@ class Job:
                 "mode": self.mode,
                 "app": app_snapshot,
                 "app_id": self.app.get("id"),
-                "app_name": self.app.get("name"),
+                "app_name": self.app.get("name") or self.confirm_name,
+                "confirm_name": self.confirm_name or self.app.get("name") or "",
                 "created_at": self.created_at,
                 "updated_at": self.updated_at,
                 "finished_at": self.finished_at,
@@ -224,13 +245,21 @@ class Job:
             return None
         app = data.get("app")
         job_id = data.get("id")
-        if not isinstance(app, dict) or not app.get("name"):
+        if not isinstance(app, dict):
+            return None
+        saved_name = data.get("confirm_name") or data.get("app_name") or app.get("name") or ""
+        if not str(saved_name).strip():
             return None
         if not isinstance(job_id, str) or not _JOB_ID_RE.match(job_id):
             return None
         job = cls.__new__(cls)
         job.id = job_id
         job.app = copy.deepcopy(app)
+        # Older snapshots only stored app_name at the top level. Keep that as
+        # the authoritative confirmation target when app.name is missing.
+        job.confirm_name = str(saved_name)
+        if not str(job.app.get("name") or "").strip():
+            job.app["name"] = job.confirm_name
         mode = data.get("mode")
         job.mode = mode if mode in {"uninstall", "force"} else "force"
         job.jobs = jobs
@@ -508,8 +537,14 @@ class Job:
                 return {"ok": False, "error": "当前任务不在可清理阶段"}
             if not self.leftover:
                 return {"ok": False, "error": "没有残留清单"}
-        if permanent and confirm_name.strip() != self.app.get("name", "").strip():
-            return {"ok": False, "error": "永久删除需要输入完整软件名称"}
+        if permanent:
+            provided = normalize_software_name(confirm_name)
+            expected = {
+                normalize_software_name(self.app.get("name")),
+                normalize_software_name(self.confirm_name),
+            } - {""}
+            if not provided or provided not in expected:
+                return {"ok": False, "error": "永久删除需要输入完整软件名称"}
         wanted = set(item_ids or [])
         all_items = {i["id"]: i for i in (self.leftover.get("items") or [])}
         chosen = [all_items[i] for i in item_ids if i in all_items]
@@ -714,7 +749,10 @@ class JobsManager:
             return {"ok": False, "error": app.get("protected_reason") or "该软件受保护，不能自动卸载"}
         if mode not in {"uninstall", "force"}:
             return {"ok": False, "error": "未知的操作模式"}
-        if mode == "force" and confirm_name.strip() != (app.get("name") or "").strip():
+        expected_name = normalize_software_name(app.get("name"))
+        if mode == "force" and (
+            not expected_name or normalize_software_name(confirm_name) != expected_name
+        ):
             return {"ok": False, "error": "强制清理需要输入完整软件名称"}
         if mode == "uninstall" and not app.get("can_uninstall"):
             return {"ok": False, "error": "该软件没有可用的官方卸载命令，请使用「仅清理残留」"}
