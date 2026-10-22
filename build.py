@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
 RELEASE = ROOT / "release"
@@ -18,7 +24,9 @@ VERSION = "1.1.0"
 
 def run(command: list[str]) -> None:
     print("+ " + " ".join(command), flush=True)
-    subprocess.run(command, check=True, cwd=ROOT)
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    subprocess.run(command, check=True, cwd=ROOT, env=env)
 
 
 def ensure_icon() -> Path:
