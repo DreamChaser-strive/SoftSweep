@@ -6,11 +6,15 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import socket
 import sys
+import threading
 import time
 import winreg
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -324,6 +328,74 @@ def test_cleanup_confirm_frontend() -> None:
     check(block.index("let confirmName") < block.index("renderJobModal(true)"),
           "读取名称发生在弹窗重绘之前")
     check("canonicalSoftwareName" in source, "前端使用统一的名称规范化函数")
+    check("retryInput.value = confirmName" in block, "请求失败后保留用户已输入的名称")
+
+
+class _VersionProbeHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):  # noqa: N802
+        body = json.dumps({"version": "9.9.9"}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_instance_handover() -> None:
+    """A new build must detect an outdated running instance and take over."""
+    import app as app_module
+
+    check(app_module._session_token("http://127.0.0.1:1234/?t=abc123") == "abc123",
+          "会话地址可以解析访问令牌")
+    check(app_module._session_token("http://127.0.0.1:1234/") == "",
+          "缺少令牌时返回空字符串")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _VersionProbeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_port
+    try:
+        check(app_module._fetch_server_version(port, "tok") == "9.9.9",
+              "可以读取正在运行服务的版本")
+        check(app_module._fetch_server_version(port, "") == "",
+              "缺少令牌时不读取运行版本")
+    finally:
+        server.shutdown()
+        server.server_close()
+    check(app_module._fetch_server_version(port, "tok") == "",
+          "服务关闭后读取版本返回空")
+
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(8)
+    blocker.settimeout(0.2)
+    busy_port = blocker.getsockname()[1]
+    stop = threading.Event()
+
+    def accept_loop() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = blocker.accept()
+                conn.close()
+            except OSError:
+                continue
+
+    acceptor = threading.Thread(target=accept_loop, daemon=True)
+    acceptor.start()
+    try:
+        check(not app_module._wait_port_free(busy_port, timeout=0.8),
+              "端口仍被占用时接管等待失败")
+    finally:
+        stop.set()
+        blocker.close()
+        acceptor.join(timeout=1)
+    check(app_module._wait_port_free(busy_port, timeout=3.0),
+          "端口释放后接管等待成功")
 
 
 def test_icon_boundaries() -> None:
@@ -449,6 +521,7 @@ def main() -> int:
         test_job_cleanup_and_recovery()
         test_name_confirmation()
         test_cleanup_confirm_frontend()
+        test_instance_handover()
         test_store_app_size_and_publisher()
         test_size_probe_safety()
         test_icon_boundaries()

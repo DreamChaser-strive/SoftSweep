@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+import urllib.request
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,7 +25,7 @@ from core import winutil as wu
 from core.jobs import JOBS
 from core.scanner import SCANNER
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 INSTANCE_MUTEX_NAME = "Local\\SoftSweep.SingleInstance.9D4A2B6F"
 ERROR_ALREADY_EXISTS = 183
 WEB_DIR = wu.APP_DIR / "web"
@@ -54,7 +55,7 @@ class AppServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SoftSweep/1.2.1"
+    server_version = "SoftSweep/1.2.2"
     sys_version = ""
 
     # ------------------------------------------------------------- utilities
@@ -423,6 +424,110 @@ def _open_app_window(url: str, *, wait_for_exit: bool) -> subprocess.Popen | Non
     return None
 
 
+def _session_token(url: str) -> str:
+    """Extract the one-time access token from a session URL."""
+    try:
+        query = urllib.parse.urlsplit(url or "").query
+        values = urllib.parse.parse_qs(query).get("t") or []
+        return str(values[0]) if values else ""
+    except ValueError:
+        return ""
+
+
+def _fetch_server_version(port: int, token: str, timeout: float = 2.0) -> str:
+    """Ask a running SoftSweep server which version it serves."""
+    if not token or not port:
+        return ""
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/state",
+        headers={"X-Token": token},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return str(data.get("version") or "")
+    except (OSError, ValueError, UnicodeError):
+        return ""
+
+
+def _quit_old_server(port: int, token: str) -> None:
+    """Ask an outdated instance to shut down so the new build can take over."""
+    if not token or not port:
+        return
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/quit",
+        data=b"{}",
+        method="POST",
+        headers={"X-Token": token, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=3.0) as resp:
+            resp.read()
+    except OSError:
+        pass
+
+
+def _wait_port_free(port: int, timeout: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                time.sleep(0.2)
+        except OSError:
+            return True
+    return False
+
+
+def _acquire_instance_mutex_retry(timeout: float = 6.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        acquired, mutex = _acquire_instance_mutex()
+        if acquired:
+            return acquired, mutex
+        time.sleep(0.2)
+    return False, None
+
+
+def _terminate_process(pid: int) -> None:
+    """Last resort for an outdated instance that ignores the quit request."""
+    if not pid or pid == os.getpid():
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F"],
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _close_old_app_window(port: int) -> None:
+    """Close a leftover app-style window that still points at the old port."""
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -like '*--app=http://127.0.0.1:{port}/*' }} | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _notice(message: str, title: str = "SoftSweep 净软") -> None:
+    """Show a native dialog; the packaged build has no console to print to."""
+    print(message)
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, title, 0x40030)
+    except Exception:
+        pass
+
+
 def _request_app_shutdown(server: AppServer):
     threading.Thread(target=server.shutdown, daemon=True).start()
     proc = _APP_BROWSER_PROCESS
@@ -457,9 +562,37 @@ def main() -> int:
     if not acquired:
         session = _load_session()
         if session and _server_is_ready(int(session["port"]), timeout=1.0):
-            _open_app_window(session["url"], wait_for_exit=False)
-            print("SoftSweep 已在运行，已打开新的应用窗口")
-            return 0
+            port = int(session["port"])
+            token = _session_token(session.get("url") or "")
+            # Prefer the live answer; fall back to the version the session file
+            # recorded so a blocked or filtered probe still detects old builds.
+            running_version = _fetch_server_version(port, token) or str(
+                session.get("version") or ""
+            )
+            if not running_version or running_version == APP_VERSION:
+                _open_app_window(session["url"], wait_for_exit=False)
+                print("SoftSweep 已在运行，已打开新的应用窗口")
+                return 0
+            # An outdated instance owns the single-instance mutex. Connecting a
+            # new window to it would silently keep serving the old buggy UI, so
+            # retire it first and let this build take over.
+            print(
+                f"检测到旧版本 SoftSweep（{running_version}）正在运行，"
+                f"正在切换到 {APP_VERSION} …"
+            )
+            _quit_old_server(port, token)
+            if not _wait_port_free(port, timeout=5.0):
+                old_pid = session.get("pid")
+                if isinstance(old_pid, int) and old_pid > 0:
+                    _terminate_process(old_pid)
+                if not _wait_port_free(port, timeout=8.0):
+                    _notice(
+                        f"检测到旧版本 SoftSweep（{running_version}）仍在运行，"
+                        "新版本无法接管。\n请关闭所有 SoftSweep 窗口后，再重新打开本程序。"
+                    )
+                    return 1
+            _close_old_app_window(port)
+            acquired, instance_mutex = _acquire_instance_mutex_retry()
 
     restored_jobs = JOBS.restore_saved()
     if restored_jobs:

@@ -1402,6 +1402,9 @@
     } catch (err) {
       state.cleanupSubmitting = false;
       renderJobModal(true);
+      // Keep what the user typed so a failed request does not force retyping.
+      const retryInput = permanent ? $("permanentNameInput") : null;
+      if (retryInput && confirmName) retryInput.value = confirmName;
       if (!err.handled) toast(err.message || "清理失败", "error");
     }
   }
