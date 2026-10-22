@@ -431,6 +431,7 @@ svg { display: block; }
   max-height: 120px; overflow: auto;
 }
 .path-box .path-label { display: block; font: 10px var(--font); color: var(--faint); margin-bottom: 3px; }
+.path-box .path-note { display: block; margin-top: 4px; font: 10px var(--font); color: var(--faint); }
 .drawer-section-title { display: flex; align-items: center; gap: 8px; margin: 22px 0 9px; font-size: 12px; font-weight: 700; }
 .drawer-section-title .ico { width: 15px; height: 15px; color: var(--muted); }
 .warning-list { display: flex; flex-direction: column; gap: 7px; }

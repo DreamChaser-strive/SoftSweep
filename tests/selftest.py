@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from core import icons  # noqa: E402
 from core import jobs as job_engine  # noqa: E402
+from core import scanner as scan_engine  # noqa: E402
 from core import winutil as wu  # noqa: E402
 
 runner = "SoftSweepSelfTest_{}_{}".format(os.getpid(), int(time.time()))
@@ -243,6 +244,101 @@ def test_icon_boundaries() -> None:
         expect_refused(icons.valid_app_id(bad), f"拒绝非法应用 ID {bad!r}")
 
 
+def test_size_probe_safety() -> None:
+    """Folder inference may only ever point at one product's own directory."""
+    pf = str(wu.PROGRAM_FILES)
+    leaf = scan_engine._looks_like_app_leaf
+    expect_refused(leaf(pf), "拒绝 Program Files 根目录")
+    expect_refused(leaf(str(wu.SYSTEM_DRIVE)), "拒绝系统盘根目录")
+    expect_refused(leaf(str(wu.LOCAL_APPDATA)), "拒绝 AppData\\Local 根目录")
+    expect_refused(leaf(pf + "\\SomeVendor"), "拒绝厂商共享目录（名称不匹配软件）")
+    expect_refused(leaf(pf + "\\Common Files"), "拒绝公共组件目录")
+    expect_refused(leaf(pf + "\\SomeVendor\\data"), "拒绝 data 之类的子目录")
+    check(leaf(pf + "\\SomeVendor\\SomeApp"), "接受厂商目录下的具体应用目录")
+    check(leaf(pf + "\\Microsoft OneDrive", {"microsoftonedrive"}), "名称与软件一致时接受一级目录")
+
+    normalise = scan_engine._normalise_probe_folder
+    check(normalise(pf + "\\SomeApp\\bin\\app.exe") == pf + "\\SomeApp", "从 bin 子目录回到应用目录",
+          normalise(pf + "\\SomeApp\\bin\\app.exe"))
+    check(not normalise(pf + "\\SomeApp\\data\\icon").endswith("icon"), "跳出 data/icon 这类资源目录")
+    check(normalise(str(TEST_ROOT) + "\\payload.txt") == str(TEST_ROOT), "文件同级目录即应用目录")
+
+    apps = [
+        {"id": "a1", "kind": "registry", "protected": False, "install_location": str(TEST_ROOT / "host"),
+         "location_exists": True, "size_state": "computing", "size_probe_path": ""},
+        {"id": "a2", "kind": "registry", "protected": False, "install_location": "",
+         "location_exists": False, "size_state": "unknown",
+         "size_probe_path": str(TEST_ROOT)},
+        {"id": "a3", "kind": "registry", "protected": False, "install_location": "",
+         "location_exists": False, "size_state": "unknown",
+         "size_probe_path": str(TEST_ROOT / "only_app")},
+    ]
+    (TEST_ROOT / "host").mkdir()
+    (TEST_ROOT / "only_app").mkdir()
+    scan_engine._validate_size_probes(apps)
+    expect_refused(bool(apps[1]["size_probe_path"]), "包含其他软件安装目录的推断结果被丢弃")
+    check(apps[1]["size_state"] == "unknown", "被丢弃后保持未知状态")
+    check(apps[2]["size_probe_path"] == str(TEST_ROOT / "only_app"), "独立的应用目录被保留")
+    check(apps[2]["size_state"] == "computing", "保留的推断目录进入统计队列")
+
+
+def test_store_app_size_and_publisher() -> None:
+    """Store apps must report a real size instead of a placeholder."""
+    install = TEST_ROOT / "store_install"
+    data = TEST_ROOT / "store_data"
+    install.mkdir()
+    data.mkdir()
+    (install / "app.exe").write_bytes(b"x" * 4096)
+    (data / "state.db").write_bytes(b"y" * 8192)
+
+    manager = scan_engine.ScanManager()
+    app = {
+        "kind": "uwp",
+        "install_location": str(install),
+        "package_data_path": str(data),
+        "location_exists": True,
+    }
+    measurement = manager._measure_app_size(app)
+    check(measurement["total"] == 4096 + 8192, "商店应用大小等于安装目录加应用数据", str(measurement))
+    check(measurement["denied"] is False, "商店应用目录可读时不标记为无权限")
+
+    nested = dict(app, package_data_path=str(install))
+    check(manager._measure_app_size(nested)["data_bytes"] is None, "应用数据位于安装目录内时不重复计算")
+
+    missing = {
+        "kind": "uwp",
+        "install_location": str(TEST_ROOT / "does_not_exist"),
+        "package_data_path": "",
+        "location_exists": True,
+    }
+    gone = manager._measure_app_size(missing)
+    check(gone["total"] is None and gone["install_bytes"] is None,
+          "目录缺失且无推断时不显示 0 字节", str(gone))
+
+    cases = [
+        (("OpenAI.Codex", "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B", ""), "OpenAI"),
+        (("OpenAI.Codex", "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B", "OpenAI Inc."), "OpenAI Inc."),
+        (("Intel.Graphic", "CN=INTEL CORP, OU=Testing, O=Intel", ""), "INTEL CORP"),
+    ]
+    for args, expected in cases:
+        got = scan_engine._uwp_publisher(*args)
+        check(got == expected, f"商店应用发布商解析为「{expected}」", f"实际：{got}")
+
+    apps, warnings = scan_engine.scan_uwp_apps()
+    if not apps:
+        check(False, "读取本机商店应用列表", "；".join(warnings) or "未返回任何应用")
+        return
+    check(all(a["size_state"] == "computing" and a["size"]["computing"] for a in apps),
+          "商店应用登记为待统计状态")
+    check(all(a["install_location_display"] == a["install_location"] for a in apps),
+          "商店应用显示真实安装路径")
+    guidish = [a["name"] for a in apps if scan_engine._GUID_RE.fullmatch(a["publisher"] or "")]
+    check(not guidish, "商店应用发布商不显示证书 GUID", "、".join(guidish[:5]))
+    measured = [manager._measure_app_size(a) for a in apps]
+    with_size = sum(1 for m in measured if (m["total"] or 0) > 0)
+    check(with_size >= max(1, len(apps) // 2), "多数商店应用可以统计到大小", f"{with_size}/{len(apps)}")
+
+
 def cleanup() -> None:
     try:
         wu._delete_reg_tree(winreg.HKEY_CURRENT_USER, rf"Software\{runner}")
@@ -263,6 +359,8 @@ def main() -> int:
         test_recycle_and_permanent()
         test_registry()
         test_job_cleanup_and_recovery()
+        test_store_app_size_and_publisher()
+        test_size_probe_safety()
         test_icon_boundaries()
     except Exception as exc:
         check(False, "自检执行异常", f"{type(exc).__name__}: {exc}")

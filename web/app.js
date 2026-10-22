@@ -441,37 +441,63 @@
       `${state.apps.length} 款软件 · 可管理 ${totalPrimary} · 受保护 ${protectedCount} · ${scope} · ${scanned}`;
   }
 
+  const MEANINGFUL_DATA_BYTES = 1024 * 1024;
+
+  function hasAppData(size) {
+    return Number(size.data_bytes) >= MEANINGFUL_DATA_BYTES && Number(size.install_bytes) > 0;
+  }
+
+  function sizeSubText(app) {
+    const size = app.size || {};
+    if (size.computing) return "继续统计中";
+    if (size.partial) return "文件较多，估算";
+    if (hasAppData(size)) return "含应用数据";
+    if (size.probe) return "按程序目录统计";
+    if (size.exact) return "已统计";
+    if (size.estimated) return "安装器估算";
+    return "";
+  }
+
+  function sizeUnknownText(app) {
+    const state = app.size_state || "";
+    if (state === "computing") return "计算中…";
+    if (state === "denied") return isUwpApp(app) ? "无读取权限" : "无法访问";
+    if (state === "missing") return "目录已不存在";
+    if (app.protected) return "受保护";
+    return "未统计";
+  }
+
+  function isUwpApp(app) {
+    return app.kind === "uwp";
+  }
+
   function sizeText(app) {
     const size = app.size || {};
     if (size.bytes != null && Number(size.bytes) >= 0) {
       const approximate = size.estimated && !size.exact ? "约 " : "";
       let sub = "";
       if (size.computing) sub = "，继续统计中";
-      else if (size.partial) sub = "，估算";
+      else if (hasAppData(size)) {
+        sub = `（安装 ${humanSize(size.install_bytes)} · 数据 ${humanSize(size.data_bytes)}）`;
+      } else if (size.partial) sub = "，估算";
+      else if (size.probe) sub = "（按程序所在目录统计）";
       else if (size.estimated) sub = "，安装器估算";
       return `${approximate}${humanSize(size.bytes)}${sub}`;
     }
-    if (size.computing) return "计算中…";
-    if (app.kind === "uwp") return "商店应用，未统计";
-    if (app.protected) return "受保护，未统计";
-    return "未知";
+    return sizeUnknownText(app);
   }
 
   function sizeCell(app) {
     const size = app.size || {};
     if (size.bytes != null && Number(size.bytes) >= 0) {
       const approximate = size.estimated && !size.exact ? "约 " : "";
-      let sub = "";
-      if (size.computing) sub = "继续统计中";
-      else if (size.exact) sub = "已统计";
-      else if (size.partial) sub = "文件较多，估算";
-      else if (size.estimated) sub = "安装器估算";
-      return `<div class="size-main">${approximate}${humanSize(size.bytes)}</div>${sub ? `<div class="size-sub">${sub}</div>` : ""}`;
+      const sub = sizeSubText(app);
+      const tip = hasAppData(size)
+        ? ` title="安装 ${esc(humanSize(size.install_bytes))} · 应用数据 ${esc(humanSize(size.data_bytes))}"`
+        : "";
+      return `<div class="size-main"${tip}>${approximate}${humanSize(size.bytes)}</div>${sub ? `<div class="size-sub">${sub}</div>` : ""}`;
     }
-    if (size.computing) return `<div class="size-main size-unknown">计算中…</div>`;
-    if (app.kind === "uwp") return `<div class="size-main size-unknown">—</div><div class="size-sub">商店应用</div>`;
-    if (app.protected) return `<div class="size-main size-unknown">—</div><div class="size-sub">受保护</div>`;
-    return `<div class="size-main size-unknown">—</div><div class="size-sub">未知</div>`;
+    return `<div class="size-main size-unknown">${sizeUnknownText(app)}</div>`;
   }
 
   function appRow(app) {
@@ -641,6 +667,7 @@
         <div class="meta-item"><div class="meta-label">软件类型</div><div class="meta-value">${isUwp ? "商店应用" : "Win32 桌面程序"}</div></div>
       </div>
       <div class="path-box"><span class="path-label">安装位置</span>${locationDisplay ? esc(locationDisplay) : "注册表中未记录安装位置"}</div>
+      ${!locationDisplay && app.size_probe_path ? `<div class="path-box"><span class="path-label">大小统计目录</span>${esc(app.size_probe_path)}<span class="path-note">仅用于统计占用空间，不会作为清理目标</span></div>` : ""}
       ${protectedBox}
       ${warningHtml}
       ${!app.protected && (adminWarning || warnings.length === 0) ? `<div class="drawer-section-title">${icon("i-shield")}清理说明</div><div class="warning-list">${adminWarning}</div>` : ""}

@@ -11,20 +11,26 @@ import time
 import traceback
 import winreg
 from datetime import datetime
+from pathlib import Path
 
 from . import icons as icon_store
 from .winutil import (
     APP_DIR,
     LOCAL_APPDATA,
+    LOCAL_APPDATA_LOW,
+    PROGRAM_DATA,
     PROGRAM_FILES,
     PROGRAM_FILES_X86,
     WINDOWS_DIR,
     app_aliases,
+    command_executable,
     compact,
     decode_output,
     display_env_path,
     is_admin,
+    is_safe_dir_path,
     make_id,
+    match_folder_to_app,
     measure_path,
     norm_text,
     run_powershell,
@@ -81,6 +87,131 @@ def _resolve_install_location(values: dict, name: str, publisher: str) -> str:
                 if os.path.isabs(location) and os.path.isdir(location):
                     return location
     return ""
+
+
+_UPWARD_GENERIC = {
+    "app", "apps", "bin", "bin64", "x64", "x86", "current", "main", "resources",
+    "uninstall", "uninst", "utility", "application", "code", "root", "release",
+    "icon", "icons", "assets", "res", "resource", "data", "images", "image",
+    "locales", "locale", "plugin", "plugins", "extension", "extensions",
+    "cache", "caches", "log", "logs", "temp", "tmp", "dist", "exe", "win32",
+}
+_PROBE_DENY_NAMES = _UPWARD_GENERIC | {
+    "program files", "program files (x86)", "windows", "users", "user",
+    "programdata", "appdata", "packages", "common files", "downloads",
+    "documents", "desktop", "pictures", "videos", "music",
+}
+_LOCAL_CHILD_CONTAINERS = {
+    "programs", "packages", "temp", "microsoft", "publishers", "comms",
+    "connected devices", "crashdumps", "iconcache", "asset cache", "history",
+    "placeholderdata", "peerdist", "deployment",
+}
+_VERSION_DIR_RE = re.compile(r"^\d+(\.\d+){1,3}([-.][0-9a-z]+)*$", re.IGNORECASE)
+
+
+def _looks_like_app_leaf(folder: str, aliases: set[str] | None = None) -> bool:
+    """Refuse container roots so a size probe never counts a whole vendor tree."""
+    try:
+        parts = Path(os.path.abspath(folder)).parts
+    except (OSError, ValueError):
+        return False
+    if len(parts) < 2:
+        return False
+    name = parts[-1].casefold()
+    if name in _PROBE_DENY_NAMES or len(name) < 2:
+        return False
+    named_match = bool(aliases) and match_folder_to_app(parts[-1], aliases) >= 2
+    for root in (PROGRAM_FILES, PROGRAM_FILES_X86, LOCAL_APPDATA, LOCAL_APPDATA_LOW,
+                 PROGRAM_DATA, WINDOWS_DIR):
+        root_parts = Path(root).parts
+        if parts[: len(root_parts)] != root_parts:
+            continue
+        if len(parts) == len(root_parts):
+            return False
+        if len(parts) > len(root_parts) + 1:
+            continue
+        # The folder is a direct child of a well-known root.
+        if root in (PROGRAM_DATA, WINDOWS_DIR, LOCAL_APPDATA_LOW):
+            return False
+        if root == LOCAL_APPDATA:
+            # %LOCALAPPDATA%\<App> is the normal single-installer layout, but
+            # shared sub-roots must never be measured as one product.
+            return name not in _LOCAL_CHILD_CONTAINERS
+        # Program Files children are usually vendor folders.
+        return named_match
+    return True
+
+
+def _normalise_probe_folder(exe: str) -> str:
+    """Walk out of bin/app/version sub-folders to the folder that holds the app."""
+    folder = os.path.dirname(os.path.abspath(exe))
+    for _ in range(3):
+        parent = os.path.dirname(folder)
+        if not parent or parent == folder:
+            break
+        name = os.path.basename(folder).casefold()
+        if name in _UPWARD_GENERIC or _VERSION_DIR_RE.match(name):
+            folder = parent
+            continue
+        break
+    return folder
+
+
+def _inferred_program_folder(raw: dict, aliases: set[str] | None = None) -> str:
+    """Program folder inferred from the app's own exe paths, for size counting only.
+
+    This value is never used as a cleanup target: uninstall and cleanup keep relying
+    on the registry InstallLocation plus the audited leftover scanner.
+    """
+    for command in (raw.get("display_icon"), raw.get("quiet_uninstall_string"), raw.get("uninstall_string")):
+        exe = command_executable(_safe_str(command))
+        if not exe:
+            continue
+        exe = os.path.expandvars(exe)
+        if not os.path.isabs(exe) or not os.path.exists(exe):
+            continue
+        folder = _normalise_probe_folder(exe)
+        if not _looks_like_app_leaf(folder, aliases):
+            continue
+        if not is_safe_dir_path(folder, trusted=True):
+            continue
+        return folder
+    return ""
+
+
+def _validate_size_probes(apps: list[dict]) -> None:
+    """Drop probes that would count a shared container instead of one product."""
+    known = [
+        os.path.normcase(os.path.abspath(app["install_location"])).rstrip(os.sep)
+        for app in apps if app.get("install_location")
+    ]
+    usage: dict[str, int] = {}
+    for app in apps:
+        probe = app.get("size_probe_path") or ""
+        if not probe:
+            continue
+        n = os.path.normcase(os.path.abspath(probe)).rstrip(os.sep)
+        if any(other != n and (other.startswith(n + os.sep) or n.startswith(other + os.sep))
+               for other in known):
+            app["size_probe_path"] = ""
+            continue
+        usage[n] = usage.get(n, 0) + 1
+    for app in apps:
+        if app.get("protected"):
+            continue
+        probe = app.get("size_probe_path") or ""
+        if not probe:
+            if (app.get("install_location") and not app.get("location_exists")
+                    and app.get("size_state") == "unknown"):
+                app["size_state"] = "missing"
+            continue
+        n = os.path.normcase(os.path.abspath(probe)).rstrip(os.sep)
+        if usage.get(n, 0) >= 4:
+            app["size_probe_path"] = ""
+            continue
+        if app.get("size_state") in ("unknown", "estimated"):
+            app["size_state"] = "computing"
+
 
 # --------------------------------------------------------------- classification
 _DEV = [
@@ -422,6 +553,39 @@ def _safe_str(value) -> str:
     return str(value).strip().strip("\x00")
 
 
+_GUID_RE = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", re.IGNORECASE)
+_CERT_LABEL_RE = re.compile(r"^(CN|O|L|S|C|E|OU|ST)\s*=", re.IGNORECASE)
+
+
+def _uwp_publisher(package_name: str, publisher_dn: str, display_publisher: str) -> str:
+    """A readable publisher for a Store package.
+
+    Store packages are often signed with a certificate subject that only
+    contains a GUID, so the manifest publisher name or the package's vendor
+    prefix is used instead.
+    """
+    candidates: list[str] = []
+    for raw in (display_publisher, publisher_dn):
+        value = _safe_str(raw)
+        if not value:
+            continue
+        if _CERT_LABEL_RE.match(value):
+            chunks = [part.strip() for part in re.split(r",(?![^\"']*[\"])", value)]
+            for chunk in chunks:
+                if chunk.upper().startswith("CN=") or chunk.upper().startswith("O="):
+                    candidates.append(chunk.split("=", 1)[1].strip(' "'))
+                    break
+        else:
+            candidates.append(value)
+    for candidate in candidates:
+        if candidate and not _GUID_RE.fullmatch(candidate):
+            return candidate[:120]
+    prefix = _safe_str(package_name).split(".")[0].strip()
+    if prefix and not _GUID_RE.fullmatch(prefix):
+        return prefix[:120]
+    return "Microsoft Store 发布商"
+
+
 def _parse_date(value) -> str | None:
     s = _safe_str(value)
     if re.fullmatch(r"\d{8}", s):
@@ -601,6 +765,7 @@ def scan_registry_apps() -> tuple[list[dict], list[str]]:
     apps = []
     for raw in merged.values():
         apps.append(_build_registry_app(raw))
+    _validate_size_probes(apps)
     return apps, warnings
 
 
@@ -653,15 +818,20 @@ def _build_registry_app(raw: dict) -> dict:
     exists = bool(location and os.path.isdir(location))
     if location and not exists:
         warnings.append("注册表中记录的安装目录当前不存在")
+    aliases = app_aliases(name, publisher)
+    probe_folder = "" if (protected or exists) else _inferred_program_folder(raw, aliases)
     category_info = CATEGORY_MAP.get(category, CATEGORY_MAP["other"])
     app_id = make_id("a", raw["uninstall_key"])
     source = "system" if protected else "thirdparty"
     size = {
         "bytes": raw.get("estimated_bytes"),
+        "install_bytes": None,
+        "data_bytes": None,
         "estimated": bool(raw.get("estimated_bytes")),
         "exact": False,
         "computing": False,
         "partial": False,
+        "probe": False,
     }
     return {
         "id": app_id,
@@ -700,9 +870,13 @@ def _build_registry_app(raw: dict) -> dict:
             )
         ),
         "size": size,
-        "size_state": "protected" if protected else ("computing" if exists else ("estimated" if raw.get("estimated_bytes") else "unknown")),
+        "size_probe_path": probe_folder,
+        "size_state": "protected" if protected else (
+            "computing" if (exists or probe_folder)
+            else ("estimated" if raw.get("estimated_bytes") else "unknown")
+        ),
         "location_exists": exists,
-        "aliases": sorted(app_aliases(name, publisher)),
+        "aliases": sorted(aliases),
     }
 
 
@@ -716,10 +890,12 @@ Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
   $storeLogo = ''
   $square44 = ''
   $square150 = ''
+  $pubDisplay = ''
   try {
     $manifest = Get-AppxPackageManifest -Package $_.PackageFullName -ErrorAction Stop
     if ($manifest -and $manifest.Package.Properties) {
       $storeLogo = [string]$manifest.Package.Properties.Logo
+      $pubDisplay = [string]$manifest.Package.Properties.PublisherDisplayName
     }
     foreach ($application in @($manifest.Package.Applications.Application)) {
       if (-not $square44 -and $application.VisualElements.Square44x44Logo) {
@@ -736,6 +912,7 @@ Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
     PackageFamilyName = [string]$_.PackageFamilyName
     Version = [string]$_.Version
     Publisher = [string]$_.Publisher
+    PublisherDisplayName = $pubDisplay
     InstallLocation = [string]$_.InstallLocation
     SignatureKind = [string]$_.SignatureKind
     NonRemovable = [bool]$(try { $_.NonRemovable } catch { $false })
@@ -777,8 +954,9 @@ $out | ConvertTo-Json -Compress -Depth 4
             continue
         friendly = _friendly_uwp(name)
         publisher_dn = _safe_str(item.get("Publisher"))
-        m = re.search(r"CN=([^,]+)", publisher_dn, re.IGNORECASE)
-        publisher = (m.group(1) if m else publisher_dn).strip()
+        publisher = _uwp_publisher(
+            name, publisher_dn, _safe_str(item.get("PublisherDisplayName"))
+        )
         category = _category_for_uwp(name, friendly)
         protected_reason = UWP_PROTECTED.get(name, "")
         non_removable = bool(item.get("NonRemovable"))
@@ -795,6 +973,8 @@ $out | ConvertTo-Json -Compress -Depth 4
         family = _safe_str(item.get("PackageFamilyName"))
         full = _safe_str(item.get("PackageFullName"))
         category_info = CATEGORY_MAP.get(category, CATEGORY_MAP["other"])
+        install_location = _safe_str(item.get("InstallLocation"))
+        package_data_path = str(LOCAL_APPDATA / "Packages" / family) if family else ""
         app = {
             "id": make_id("u", family or full),
             "kind": "uwp",
@@ -802,9 +982,10 @@ $out | ConvertTo-Json -Compress -Depth 4
             "version": _safe_str(item.get("Version")),
             "publisher": publisher,
             "install_date": None,
-            "install_location": _safe_str(item.get("InstallLocation")),
-            "install_location_display": "WindowsApps（系统保护目录）",
-            "on_system_drive": system_drive_is(_safe_str(item.get("InstallLocation")) or "C:\\"),
+            "install_location": install_location,
+            "install_location_display": install_location,
+            "package_data_path": package_data_path,
+            "on_system_drive": system_drive_is(install_location or "C:\\"),
             "uninstall_string": "",
             "quiet_uninstall_string": "",
             "display_icon": "",
@@ -834,8 +1015,17 @@ $out | ConvertTo-Json -Compress -Depth 4
             "can_force": not protected,
             "uninstall_kind": "uwp",
             "requires_admin": False,
-            "size": {"bytes": None, "estimated": False, "exact": False, "computing": False, "partial": False},
-            "size_state": "store",
+            "size": {
+                "bytes": None,
+                "install_bytes": None,
+                "data_bytes": None,
+                "estimated": False,
+                "exact": False,
+                "computing": True,
+                "partial": False,
+                "probe": False,
+            },
+            "size_state": "computing",
             "location_exists": True,
             "aliases": sorted(app_aliases(friendly, publisher)),
         }
@@ -855,7 +1045,7 @@ class ScanManager:
         self.finished_at: float | None = None
         self.generation = 0
         self._scanning = False
-        self._size_cache: dict[str, tuple[float, int, bool]] = {}
+        self._size_cache: dict[str, tuple[float, int, bool, str | None]] = {}
 
     def start(self):
         with self.lock:
@@ -914,47 +1104,123 @@ class ScanManager:
                     self.finished_at = time.time()
             traceback.print_exc()
 
+    def _cached_measure(self, path: str, max_seconds: float) -> dict:
+        key = os.path.normcase(os.path.abspath(path))
+        cached = self._size_cache.get(key)
+        if cached and time.monotonic() - cached[0] < 600:
+            return {"bytes": cached[1], "partial": cached[2], "error": cached[3]}
+        result = measure_path(path, max_seconds=max_seconds)
+        entry = (
+            time.monotonic(),
+            int(result.get("bytes") or 0),
+            bool(result.get("partial")),
+            result.get("error"),
+        )
+        self._size_cache[key] = entry
+        return {"bytes": entry[1], "partial": entry[2], "error": entry[3]}
+
+    def _measure_app_size(self, app: dict) -> dict:
+        """Total space used by an app: install folder plus Store app data."""
+        is_uwp = app.get("kind") == "uwp"
+        recorded = app.get("install_location") or ""
+        install = recorded if (recorded and os.path.isdir(recorded)) else ""
+        used_probe = False
+        if not install:
+            install = _safe_str(app.get("size_probe_path"))
+            used_probe = bool(install and os.path.isdir(install))
+            if not used_probe:
+                install = ""
+        install_res = self._cached_measure(install, 12.0 if is_uwp else 14.0) if install else None
+        install_bytes = int(install_res["bytes"]) if install_res else 0
+
+        data_bytes = 0
+        data_res = None
+        data_path = _safe_str(app.get("package_data_path")) if is_uwp else ""
+        if data_path and os.path.isdir(data_path) and install:
+            install_norm = os.path.normcase(os.path.abspath(install)).rstrip(os.sep)
+            data_norm = os.path.normcase(os.path.abspath(data_path)).rstrip(os.sep)
+            nested = (
+                data_norm == install_norm
+                or data_norm.startswith(install_norm + os.sep)
+                or install_norm.startswith(data_norm + os.sep)
+            )
+            if not nested:
+                data_res = self._cached_measure(data_path, 10.0)
+                data_bytes = int(data_res["bytes"])
+
+        error_text = _safe_str((install_res or {}).get("error")).lower()
+        denied = bool(install_res) and install_bytes == 0 and (
+            "winerror 5" in error_text
+            or "permission" in error_text
+            or "denied" in error_text
+            or "拒绝" in error_text
+        )
+        missing = bool(install_res) and (install_res.get("error") == "not_found" or not os.path.isdir(install))
+        partial = bool((install_res or {}).get("partial")) or bool((data_res or {}).get("partial"))
+        total = None
+        if install_res and not denied and not missing:
+            total = install_bytes + data_bytes
+        return {
+            "install_bytes": install_bytes if install_res else None,
+            "data_bytes": data_bytes if data_res else None,
+            "total": total,
+            "partial": partial,
+            "denied": denied or missing,
+            "probe": used_probe,
+        }
+
     def _start_size_workers(self, generation: int, apps: list[dict]):
+        def measurable(app: dict) -> bool:
+            if app.get("protected") and app.get("kind") != "uwp":
+                return False
+            for path in (app.get("install_location") or "", _safe_str(app.get("size_probe_path"))):
+                if path and os.path.isdir(path):
+                    return True
+            return False
+
         candidates = [
             app for app in apps
-            if app["kind"] == "registry" and app.get("install_location") and
-            app.get("location_exists") and not app.get("protected")
+            if app.get("kind") in ("registry", "uwp") and measurable(app)
         ]
         if not candidates:
             return
+        # Manageable software first, then protected components; Store packages are
+        # measured by install folder plus their per-user data folder.
+        candidates.sort(key=lambda app: (bool(app.get("protected")), app["kind"] != "registry"))
         with self.lock:
             for app in candidates:
                 app["size"]["computing"] = True
                 app["size_state"] = "computing"
 
         def work(app: dict):
-            path = app["install_location"]
-            cached = self._size_cache.get(os.path.normcase(path))
-            if cached and time.monotonic() - cached[0] < 600:
-                result = {"bytes": cached[1], "partial": cached[2], "error": None}
-            else:
-                result = measure_path(path, max_seconds=14.0)
-                self._size_cache[os.path.normcase(path)] = (
-                    time.monotonic(), result["bytes"], result["partial"]
-                )
+            measurement = self._measure_app_size(app)
             with self.lock:
                 if generation != self.generation:
                     return
                 for current in self.apps:
-                    if current["id"] == app["id"]:
-                        has_estimate = bool(current["size"].get("estimated"))
-                        if result["bytes"] > 0:
-                            current["size"]["bytes"] = result["bytes"]
-                            current["size"]["exact"] = not result["partial"]
-                            current["size"]["estimated"] = False
-                            current["size_state"] = "too_many_files" if result["partial"] else "exact"
-                        elif not has_estimate:
-                            current["size"]["bytes"] = None
-                            current["size"]["exact"] = False
-                            current["size_state"] = "unknown"
-                        current["size"]["partial"] = bool(result["partial"])
-                        current["size"]["computing"] = False
-                        break
+                    if current["id"] != app["id"]:
+                        continue
+                    size = current["size"]
+                    size["install_bytes"] = measurement["install_bytes"]
+                    size["data_bytes"] = measurement["data_bytes"]
+                    size["partial"] = measurement["partial"]
+                    size["probe"] = measurement["probe"]
+                    size["computing"] = False
+                    total = measurement["total"]
+                    if measurement["denied"]:
+                        size["bytes"] = None
+                        size["exact"] = False
+                        current["size_state"] = "denied"
+                    elif total is not None:
+                        size["bytes"] = total
+                        size["exact"] = not measurement["partial"]
+                        size["estimated"] = False
+                        current["size_state"] = "too_many_files" if measurement["partial"] else "exact"
+                    elif not size.get("estimated"):
+                        size["bytes"] = None
+                        size["exact"] = False
+                        current["size_state"] = "unknown"
+                    break
 
         def guarded(app):
             try:
@@ -964,12 +1230,14 @@ class ScanManager:
                     for current in self.apps:
                         if current["id"] == app["id"]:
                             current["size"]["computing"] = False
-                            current["size_state"] = "estimated" if current["size"].get("estimated") else "unknown"
+                            current["size_state"] = (
+                                "estimated" if current["size"].get("estimated") else "unknown"
+                            )
                             break
 
         def dispatcher():
             with concurrent.futures.ThreadPoolExecutor(
-                max_workers=4, thread_name_prefix="softsweep-size"
+                max_workers=6, thread_name_prefix="softsweep-size"
             ) as pool:
                 list(pool.map(guarded, candidates))
 
