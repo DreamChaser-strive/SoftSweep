@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light">
+  <title>SoftSweep 净软 · 软件卸载与深度清理</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<svg class="svg-defs" aria-hidden="true" focusable="false">
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6.3"/><path d="M20 4v7h-7"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.4 3 8 7 10 4-2 7-5.6 7-10V6l-7-3Z"/><path d="m9.5 12 1.8 1.8 3.7-3.8"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2M7 7l1 13h8l1-13"/><path d="M10 11v5M14 11v5"/></symbol>
+  <symbol id="i-scan" viewBox="0 0 24 24"><path d="M4 9V5a1 1 0 0 1 1-1h4M20 9V5a1 1 0 0 0-1-1h-4M4 15v4a1 1 0 0 0 1 1h4M20 15v4a1 1 0 0 1-1 1h-4"/><path d="M7 12h10"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 4.3 2.8 17.4A1.8 1.8 0 0 0 4.4 20h15.2a1.8 1.8 0 0 0 1.6-2.6L13.7 4.3a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4.5 4.5L19 7"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h9v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z"/></symbol>
+  <symbol id="i-reg" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01M11 7h5M11 17h5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.1"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.1"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v9"/><path d="M6.5 6.5a8 8 0 1 0 11 0"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="m4.5 7.8 7.5 4.3 7.5-4.3M12 12v9"/></symbol>
+  <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 2.5 2.5L16 9"/></symbol>
+</svg>
+
+<div class="shell">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="SoftSweep 净软首页">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><path d="M7.5 21.5c5.8 2.8 12.2 1.6 16.4-3.1" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M9 9.2h13M9 14.2h9" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><circle cx="23.6" cy="9.2" r="1.6" fill="currentColor"/></svg>
+      </span>
+      <span class="brand-text"><strong>SoftSweep</strong><em>净软</em></span>
+    </a>
+
+    <label class="searchbox">
+      <svg class="ico"><use href="#i-search"></use></svg>
+      <input id="searchInput" type="search" placeholder="搜索软件名称、发布商或安装路径" aria-label="搜索软件名称、发布商或安装路径" autocomplete="off" spellcheck="false">
+      <kbd aria-hidden="true">/</kbd>
+    </label>
+
+    <div class="top-actions">
+      <span id="adminBadge" class="admin-badge" title="管理员权限状态">检测权限中</span>
+      <button id="historyBtn" class="btn btn-ghost" type="button" aria-label="任务记录" title="任务记录">
+        <svg class="ico"><use href="#i-history"></use></svg><span class="label">任务记录</span>
+      </button>
+      <button id="refreshBtn" class="btn btn-primary" type="button" aria-label="重新扫描" title="重新扫描">
+        <svg class="ico"><use href="#i-refresh"></use></svg><span>重新扫描</span>
+      </button>
+      <button id="quitBtn" class="icon-btn" type="button" title="退出 SoftSweep" aria-label="退出 SoftSweep">
+        <svg class="ico"><use href="#i-power"></use></svg>
+      </button>
+    </div>
+  </header>
+
+  <div id="adminBanner" class="admin-banner" hidden>
+    <svg class="ico"><use href="#i-alert"></use></svg>
+    <div>
+      <strong>当前没有管理员权限</strong>
+      <span>部分系统级软件、注册表项和 Program Files 目录可能无法读取或清理。请关闭工具，右键 <code>启动.bat</code> → 以管理员身份运行。</span>
+    </div>
+    <button id="adminHelpBtn" class="btn btn-small" type="button">查看说明</button>
+  </div>
+
+  <aside class="sidebar" aria-label="软件分类">
+    <div class="side-heading">软件分类</div>
+    <nav id="categoryNav" class="category-nav"></nav>
+    <div class="side-rule"></div>
+    <label class="switch-row">
+      <span>显示受保护组件</span>
+      <input id="showProtected" type="checkbox" role="switch">
+      <span class="switch" aria-hidden="true"></span>
+    </label>
+    <p class="side-note">系统组件、驱动和运行库默认受保护，不提供自动卸载。</p>
+    <div class="side-foot">
+      <span class="dot"></span>
+      <span>本机运行 · 数据不离开电脑</span>
+    </div>
+  </aside>
+
+  <main class="workspace">
+    <div class="workspace-head">
+      <div>
+        <p class="eyebrow">已安装软件</p>
+        <h1 id="listTitle">全部软件</h1>
+        <p id="listSummary" class="list-summary">正在准备扫描…</p>
+      </div>
+      <div class="list-controls">
+        <label class="select-wrap">
+          <span>来源</span>
+          <select id="sourceFilter">
+            <option value="all">全部来源</option>
+            <option value="thirdparty">下载安装</option>
+            <option value="store">应用商店</option>
+            <option value="system">系统内置</option>
+          </select>
+        </label>
+        <label class="select-wrap">
+          <span>排序</span>
+          <select id="sortSelect">
+            <option value="name">名称</option>
+            <option value="size">占用空间</option>
+            <option value="date">安装时间</option>
+            <option value="category">分类</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
+    <div id="scanBanner" class="scan-banner" hidden>
+      <span class="scan-pulse" aria-hidden="true"></span>
+      <div class="scan-copy">
+        <strong id="scanPhase">正在扫描…</strong>
+        <span id="scanDetail">正在读取注册表与应用商店信息</span>
+      </div>
+      <span id="pendingSizes" class="scan-count"></span>
+    </div>
+
+    <div id="noticeBox" class="notice-box" hidden></div>
+
+    <div class="list-head" aria-hidden="true">
+      <span>软件</span><span>类型</span><span>位置</span><span class="align-right">占用</span><span></span>
+    </div>
+    <div id="appList" class="app-list" aria-live="polite"></div>
+
+    <div id="emptyState" class="empty-state" hidden>
+      <div class="empty-art" aria-hidden="true">
+        <svg viewBox="0 0 120 100"><rect x="20" y="18" width="80" height="62" rx="10" fill="none" stroke="currentColor" stroke-width="2.5"/><path d="M31 34h40M31 45h58M31 56h30" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/><circle cx="89" cy="78" r="18" fill="var(--accent-soft)" stroke="currentColor" stroke-width="2.5"/><path d="m82 78 5 5 10-11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <h2>没有找到匹配的软件</h2>
+      <p>试试更换关键词、来源或分类。受保护组件可在左侧开启显示。</p>
+    </div>
+
+    <footer class="app-foot">
+      <span>SoftSweep 只在本机运行。文件默认移入回收站，注册表修改会先导出备份。</span>
+      <span id="versionText"></span>
+    </footer>
+  </main>
+</div>
+
+<div id="miniJob" class="mini-job" hidden>
+  <span class="mini-spinner" aria-hidden="true"></span>
+  <div><strong id="miniJobTitle">正在清理</strong><span id="miniJobStatus"></span></div>
+  <button id="miniJobOpen" class="btn btn-small" type="button">查看</button>
+</div>
+
+<div id="overlay" class="overlay" hidden></div>
+<aside id="appDrawer" class="drawer" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="drawerTitle" hidden></aside>
+<div id="modalRoot" class="modal-root" hidden></div>
+<div id="dialogRoot" class="modal-root dialog-root" hidden></div>
+<div id="toastRoot" class="toast-root" aria-live="polite"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

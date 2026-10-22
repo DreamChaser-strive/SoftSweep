@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.runtime/
+
+# Local user data, logs, caches and session tokens
+data/
+
+# Build output
+build/
+dist/
+release/
+*.spec
+
+# Editors and operating-system metadata
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
