@@ -385,7 +385,7 @@
       list = list.filter((a) => {
         const hay = [
           a.name, a.publisher, a.install_location, a.install_location_display,
-          a.package_name, a.category_label, a.source_label,
+          a.size_probe_path, a.package_name, a.category_label, a.source_label,
         ].join(" ").toLowerCase();
         return hay.includes(query);
       });
@@ -511,9 +511,38 @@
     return `<div class="size-main size-unknown">${sizeUnknownText(app)}</div>`;
   }
 
+  function appLocationInfo(app) {
+    const registered = String(app.install_location_display || app.install_location || "");
+    const inferred = String(app.size_probe_path || "");
+    if (registered && app.location_exists) {
+      return { path: registered, registered, inferred: false, stale: false };
+    }
+    if (inferred) {
+      return { path: inferred, registered, inferred: true, stale: false };
+    }
+    if (registered) {
+      return { path: registered, registered, inferred: false, stale: true };
+    }
+    return { path: "", registered: "", inferred: false, stale: false };
+  }
+
+  function locationTitle(info) {
+    if (info.inferred) {
+      const origin = info.registered
+        ? `注册表记录的位置已不存在：${info.registered}`
+        : "注册表未记录安装位置";
+      return `${origin}\n此目录根据软件自身的程序文件推断：${info.path}\n仅用于统计占用空间，不会作为清理目标`;
+    }
+    if (info.stale) {
+      return `注册表中记录的位置：${info.path}\n该目录当前不存在，软件可能已卸载或已移动位置`;
+    }
+    if (info.path) return info.path;
+    return "注册表未记录安装位置，也无法从卸载程序推断";
+  }
+
   function appRow(app) {
     const category = appCategory(app);
-    const location = app.install_location_display || app.install_location || "";
+    const loc = appLocationInfo(app);
     const publisher = app.publisher || "未知发布商";
     const version = app.version || "";
     const sub = `${esc(publisher)}${version ? ` <span class="sep">·</span> <span>${esc(version)}</span>` : ""}`;
@@ -533,7 +562,13 @@
         </div>
       </div>
       <div class="app-kind">${esc(app.category_label || category.label)}</div>
-      <div class="app-location ${location ? "" : "is-empty"}" title="${esc(location)}">${location ? esc(location) : "未登记安装位置"}</div>
+      <div class="app-location ${loc.path ? "" : "is-empty"}" title="${esc(locationTitle(loc))}">${
+        loc.path
+          ? `<span class="loc-path">${esc(loc.path)}</span>${loc.inferred
+              ? `<span class="loc-flag">推断</span>`
+              : loc.stale ? `<span class="loc-flag is-stale">已失效</span>` : ""}`
+          : "安装位置未知"
+      }</div>
       <div class="app-size">${sizeCell(app)}</div>
       <div class="row-arrow">${icon("i-chevron")}</div>
     </div>`;
@@ -620,8 +655,7 @@
     if (!app) return closeDrawer();
     const category = appCategory(app);
     const warnings = Array.isArray(app.warnings) ? app.warnings : [];
-    const location = app.install_location || "";
-    const locationDisplay = app.install_location_display || location;
+    const loc = appLocationInfo(app);
     const isUwp = app.kind === "uwp";
     const canUninstall = Boolean(app.can_uninstall) && !app.protected;
     const canForce = Boolean(app.can_force) && !app.protected;
@@ -633,17 +667,33 @@
     </div>` : "";
     const warningHtml = warnings.length ? `<div class="drawer-section-title">${icon("i-alert")}注意事项</div>
       <div class="warning-list">${warnings.map((w) => `<div class="warning-item">${icon("i-alert")}<span>${esc(w)}</span></div>`).join("")}</div>` : "";
-    const adminWarning = !state.isAdmin ? `<div class="warning-item">${icon("i-alert")}<span>当前为普通权限。${requiresAdmin ? "此软件的卸载和清理可能需要管理员权限；" : ""}注册表系统项可能无法修改或备份。</span></div>` : "";
+    const scanOnly = Boolean(app.stale_registration)
+      || (app.uninstaller_available === false && !isUwp);
+    const adminWarning = !state.isAdmin ? `<div class="warning-item">${icon("i-alert")}<span>当前为普通权限。${
+      scanOnly ? "清理系统注册表项可能需要管理员权限；" : requiresAdmin ? "此软件的卸载和清理可能需要管理员权限；" : ""
+    }注册表系统项可能无法修改或备份。</span></div>` : "";
     let actions = "";
     if (app.protected) {
       actions = `<div class="action-row"><button class="btn btn-ghost btn-wide" disabled type="button">${icon("i-shield")}此项目受保护</button></div>
         <p class="drawer-danger-note">受保护项目不提供自动卸载或清理。</p>`;
     } else if (canUninstall) {
+      const stale = Boolean(app.stale_registration);
+      const noUninstaller = app.uninstaller_available === false && !isUwp;
+      const primaryLabel = stale
+        ? "清理失效登记与残留"
+        : noUninstaller
+          ? "清理残留（卸载程序缺失）"
+          : isUwp ? "卸载并清理应用数据" : "卸载并深度清理";
+      const primaryHint = stale
+        ? "安装目录和卸载程序都已不存在；将直接扫描关联残留和失效的安装登记，由你确认后清理。不会直接删除任何文件。"
+        : noUninstaller
+          ? "注册的卸载程序文件不存在；将跳过官方卸载，直接扫描残留，由你确认后清理。"
+          : "先启动官方卸载程序，结束后自动扫描残留；不会直接删除任何文件。";
       actions = `<div class="action-row">
-          <button class="btn btn-primary" data-drawer-act="uninstall" type="button">${icon("i-trash")}${isUwp ? "卸载并清理应用数据" : "卸载并深度清理"}</button>
+          <button class="btn btn-primary" data-drawer-act="uninstall" type="button">${icon("i-trash")}${primaryLabel}</button>
         </div>
-        <p class="action-hint">先启动官方卸载程序，结束后自动扫描残留；不会直接删除任何文件。</p>
-        ${canForce ? `<button class="force-link" data-drawer-act="force" type="button">卸载程序损坏或无响应？改为仅清理残留</button>` : ""}`;
+        <p class="action-hint">${primaryHint}</p>
+        ${canForce && !stale && !noUninstaller ? `<button class="force-link" data-drawer-act="force" type="button">卸载程序损坏或无响应？改为仅清理残留</button>` : ""}`;
     } else if (canForce) {
       actions = `<div class="action-row">
           <button class="btn btn-primary" data-drawer-act="force" type="button">${icon("i-scan")}扫描并清理残留</button>
@@ -658,6 +708,20 @@
       ${app.package_full_name ? `<div class="detail-row">应用包<code>${esc(app.package_full_name)}</code></div>` : ""}
       ${!app.uninstall_string && !app.uninstall_key && !app.package_full_name ? `<div class="detail-row">没有可展示的卸载技术信息。</div>` : ""}
     </details>`;
+    let locationBox = "";
+    if (loc.inferred) {
+      const origin = loc.registered
+        ? `注册表记录的位置已不存在：${loc.registered}。`
+        : "注册表未记录安装位置。";
+      locationBox = `<div class="path-box"><span class="path-label">程序所在目录（推断）</span>${esc(loc.path)}<span class="path-note">${esc(origin)}该目录根据软件自身的程序文件推断，仅用于统计占用空间，不会作为清理目标。</span></div>`;
+    } else if (loc.stale) {
+      const uninstallerNote = app.uninstaller_available === false
+        ? "卸载程序文件也已缺失。"
+        : "注册表中的卸载命令仍可用，但安装目录已不存在。";
+      locationBox = `<div class="path-box"><span class="path-label">安装位置（已失效）</span>${esc(loc.path)}<span class="path-note">注册表中记录的目录当前不存在；${uninstallerNote}</span></div>`;
+    } else {
+      locationBox = `<div class="path-box"><span class="path-label">安装位置</span>${loc.path ? esc(loc.path) : "注册表未记录，也无法从卸载程序推断"}</div>`;
+    }
     const drawer = $("appDrawer");
     drawer.innerHTML = `<div class="drawer-head">
       ${avatarHtml(app, "drawer-icon app-avatar")}
@@ -677,14 +741,17 @@
         <div class="meta-item"><div class="meta-label">权限要求</div><div class="meta-value">${app.requires_admin ? "可能需要管理员" : "当前用户"}</div></div>
         <div class="meta-item"><div class="meta-label">软件类型</div><div class="meta-value">${isUwp ? "商店应用" : "Win32 桌面程序"}</div></div>
       </div>
-      <div class="path-box"><span class="path-label">安装位置</span>${locationDisplay ? esc(locationDisplay) : "注册表中未记录安装位置"}</div>
-      ${!locationDisplay && app.size_probe_path ? `<div class="path-box"><span class="path-label">大小统计目录</span>${esc(app.size_probe_path)}<span class="path-note">仅用于统计占用空间，不会作为清理目标</span></div>` : ""}
+      ${locationBox}
       ${protectedBox}
       ${warningHtml}
       ${!app.protected && (adminWarning || warnings.length === 0) ? `<div class="drawer-section-title">${icon("i-shield")}清理说明</div><div class="warning-list">${adminWarning}</div>` : ""}
-      <p class="drawer-note"><strong>清理流程：</strong>${canUninstall
-        ? "启动官方卸载程序 → 等待卸载完成 → 扫描安装目录、AppData、快捷方式和注册表 → 你确认后清理。"
-        : "扫描安装目录、AppData、快捷方式和注册表 → 你确认后清理。"}所选文件默认<strong>移入回收站</strong>，注册表修改会先导出备份；文档、下载和图片目录不会被扫描。</p>
+      <p class="drawer-note"><strong>清理流程：</strong>${app.stale_registration
+        ? "跳过官方卸载 → 扫描失效的安装登记与关联残留 → 你确认后清理。"
+        : canUninstall && app.uninstaller_available === false
+          ? "卸载程序文件缺失，跳过官方卸载 → 扫描关联残留 → 你确认后清理。"
+          : canUninstall
+            ? "启动官方卸载程序 → 等待卸载完成 → 扫描安装目录、AppData、快捷方式和注册表 → 你确认后清理。"
+            : "扫描安装目录、AppData、快捷方式和注册表 → 你确认后清理。"}所选文件默认<strong>移入回收站</strong>，注册表修改会先导出备份；文档、下载和图片目录不会被扫描。</p>
       ${tech}
     </div>
     <div class="drawer-actions">${actions}</div>`;
@@ -810,13 +877,23 @@
     const app = getApp(appId);
     if (!app) return;
     const isForce = mode === "force";
+    const stale = Boolean(app.stale_registration);
+    const missingUninstaller = app.uninstaller_available === false && app.kind !== "uwp";
+    const scanOnly = isForce || stale || missingUninstaller;
     const adminHint = !state.isAdmin && app.requires_admin
-      ? `<div class="confirm-warning">当前没有管理员权限，卸载程序可能无法运行，或在清理注册表时失败。建议以管理员身份重新启动工具。</div>` : "";
+      ? `<div class="confirm-warning">当前没有管理员权限，${
+        scanOnly ? "清理系统注册表项可能失败" : "卸载程序可能无法运行，或在清理注册表时失败"
+      }。建议以管理员身份重新启动工具。</div>` : "";
+    const scanOnlyWarning = isForce
+      ? "这里不会调用官方卸载程序。它适合卸载程序损坏、软件已卸载但注册表仍有残留的情况。若软件仍能正常使用，请优先选择“卸载并深度清理”。"
+      : stale
+        ? "安装目录与卸载程序都已不存在，这是一条失效的安装登记。将跳过官方卸载，直接扫描关联残留和失效的注册项；只有你确认后才会清理。"
+        : "注册的卸载程序文件不存在。将跳过官方卸载，直接扫描关联残留；只有你确认后才会清理。";
     const body = `<div class="confirm-visual">
         ${avatarHtml(app)}
         <div><div class="cv-name">${esc(app.name)}</div><div class="cv-sub">${esc(app.publisher || "")}${app.version ? ` · v${esc(app.version)}` : ""}</div></div>
       </div>
-      ${isForce ? `<p class="confirm-warning">这里不会调用官方卸载程序。它适合卸载程序损坏、软件已卸载但注册表仍有残留的情况。若软件仍能正常使用，请优先选择“卸载并深度清理”。</p>` : `<ul class="confirm-list">
+      ${scanOnly ? `<p class="confirm-warning">${scanOnlyWarning}</p>` : `<ul class="confirm-list">
         <li><span class="num">1</span><span>启动该软件自带的卸载程序，需要你在弹出窗口中完成操作。</span></li>
         <li><span class="num">2</span><span>卸载结束后重新扫描安装目录、AppData、快捷方式和注册表。</span></li>
         <li><span class="num">3</span><span>展示残留清单，由你勾选确认后才会删除；默认移入回收站。</span></li>
@@ -827,11 +904,15 @@
         <p class="field-hint">请输入 <code>${esc(app.name)}</code>，确认你了解这不会启动官方卸载程序。</p>
       </div>` : ""}`;
     openSimpleModal({
-      title: isForce ? "仅清理残留文件" : "卸载并深度清理",
-      subtitle: isForce ? "不会启动官方卸载程序，清理前仍会再次扫描" : (app.kind === "uwp" ? "将通过 Windows 移除商店应用" : "官方卸载程序会单独弹出"),
-      wide: isForce ? "" : "history-modal",
+      title: scanOnly
+        ? (isForce ? "仅清理残留文件" : stale ? "清理失效登记与残留" : "清理残留（卸载程序缺失）")
+        : "卸载并深度清理",
+      subtitle: scanOnly
+        ? "不会启动官方卸载程序，清理前仍会再次扫描"
+        : (app.kind === "uwp" ? "将通过 Windows 移除商店应用" : "官方卸载程序会单独弹出"),
+      wide: scanOnly ? "" : "history-modal",
       body,
-      confirm: isForce ? "开始扫描残留" : "开始卸载",
+      confirm: scanOnly ? "开始扫描残留" : "开始卸载",
       danger: false,
       onConfirm: async () => {
         let forceName = "";
@@ -992,12 +1073,17 @@
     return `<span class="status-pill ${cls}">${esc(job.status_label || job.status)}</span>`;
   }
 
+  function jobModeLabel(job) {
+    if (job.fallback_used) return "官方卸载不可用 · 残留清理";
+    return job.mode === "force" ? "仅清理残留" : "卸载与深度清理";
+  }
+
   function jobHead(job) {
     const closeAct = job.active ? "minimize-job" : "close-job";
     return `<div class="job-head">
       ${jobAvatar(job, "job-app-icon app-avatar")}
       <div class="job-head-copy">
-        <div class="job-kicker">${statusPill(job)}<span>${job.mode === "force" ? "仅清理残留" : "卸载与深度清理"}</span><span>#${esc(String(job.id || "").slice(1, 9))}</span></div>
+        <div class="job-kicker">${statusPill(job)}<span>${jobModeLabel(job)}</span><span>#${esc(String(job.id || "").slice(1, 9))}</span></div>
         <h2 class="job-title">${esc(job.app_name || "清理任务")}</h2>
         <p class="job-subtitle">${esc(job.phase || "")}${job.elevated ? " · 已请求管理员权限" : ""}</p>
       </div>
@@ -1039,7 +1125,7 @@
       actions.push(`<button class="btn btn-ghost" data-act="cancel-job" type="button">取消任务</button>`);
     }
     const facts = [
-      `<span class="fact">模式：${job.mode === "force" ? "仅清理残留" : "官方卸载 + 深度清理"}</span>`,
+      `<span class="fact">模式：${jobModeLabel(job)}</span>`,
       `<span class="fact">权限：${job.is_admin ? "管理员" : "当前用户"}${job.elevated ? "（卸载程序已提权）" : ""}</span>`,
       job.pid ? `<span class="fact">进程 PID <code>${esc(job.pid)}</code></span>` : "",
     ].filter(Boolean).join("");
@@ -1123,12 +1209,15 @@
       return `<div class="job-empty"><strong>没有发现可安全清理的残留</strong><span>软件可能已完成卸载并自行清理了文件。个人文档、下载目录不会被扫描。</span></div>
         ${jobLogs(job)}`;
     }
-    const stillWarning = job.still_installed ? `<div class="job-message warn">${icon("i-alert")}<span>${
-      job.mode === "force"
-        ? "“仅清理残留”模式不会移除卸载注册项，软件仍会出现在已安装列表中。为避免误删正在使用的程序，所有项目默认未勾选；请只选择确认无用的残留。"
-        : "软件仍在已安装列表中。它可能还没有完成卸载，所有项目已默认取消勾选；请先确认卸载完成，或只选择明确无用的项目。"
-    }</span></div>` : "";
-    const notices = Array.isArray(leftover.notice) ? leftover.notice : [];
+    const stillWarning = job.stale_registration
+      ? `<div class="job-message warn">${icon("i-alert")}<span>安装目录和卸载程序都已不存在，这是一条失效的安装登记。卸载注册项已默认勾选，确认后会从“已安装应用”中移除；用户数据和快捷方式请自行确认。</span></div>`
+      : job.still_installed ? `<div class="job-message warn">${icon("i-alert")}<span>${
+          job.mode === "force"
+            ? "“仅清理残留”模式不会移除卸载注册项，软件仍会出现在已安装列表中。为避免误删正在使用的程序，所有项目默认未勾选；请只选择确认无用的残留。"
+            : "软件仍在已安装列表中。它可能还没有完成卸载，所有项目已默认取消勾选；请先确认卸载完成，或只选择明确无用的项目。"
+        }</span></div>` : "";
+    const notices = (Array.isArray(leftover.notice) ? leftover.notice : [])
+      .filter((n) => !(job.stale_registration && String(n).includes("失效的卸载登记")));
     const topNotice = notices.length
       ? `<p class="job-notice">${notices.map((n) => esc(n)).join(" · ")}</p>` : "";
     return `${stillWarning}
@@ -1168,7 +1257,9 @@
     return `<div class="selection-bar">
       <div class="selection-info">
         <strong>已选 ${selected.length} 项</strong>
-        <span>${amount} · ${state.job.still_installed ? "软件仍在使用，请谨慎" : "移入回收站可撤销"}</span>
+        <span>${amount} · ${state.job.stale_registration
+          ? "失效登记，确认后移除"
+          : state.job.still_installed ? "软件仍在使用，请谨慎" : "移入回收站可撤销"}</span>
       </div>
       <div class="selection-actions">
         <button class="mini-link" data-act="cancel-job" type="button">放弃清理</button>
@@ -1222,9 +1313,11 @@
     const title = failed.length ? "清理完成，但有项目未处理" : "清理完成";
     const sub = job.still_installed
       ? "软件仍在已安装列表中，建议确认清理范围是否确实无用。"
-      : job.mode === "force"
-        ? "仅清理残留模式已完成。文档、下载和图片目录未被触碰。"
-        : "官方卸载过程已结束。文档、下载和图片目录未被触碰。";
+      : job.fallback_used
+        ? "官方卸载程序不可用，已按残留清理流程完成。文档、下载和图片目录未被触碰。"
+        : job.mode === "force"
+          ? "仅清理残留模式已完成。文档、下载和图片目录未被触碰。"
+          : "官方卸载过程已结束。文档、下载和图片目录未被触碰。";
     return `<div class="job-summary">
       <div class="summary-hero">
         <span class="summary-icon">${icon(failed.length ? "i-alert" : "i-check-circle")}</span>
@@ -1267,13 +1360,19 @@
     } else if (job.status === "completed") {
       body = jobSummary(job);
     } else if (job.status === "failed" || job.status === "cancelled") {
+      const canFallback = Boolean(job.can_fallback);
       body = `<div class="job-message danger">${icon("i-alert")}<span>${esc(job.message || job.phase || "任务未完成")}</span></div>
         <div class="job-hero">
           <h3>${job.status === "cancelled" ? "任务已取消" : "任务没有完成"}</h3>
           <p>${job.status === "cancelled"
             ? (job.mode === "force" ? "未执行任何文件清理。" : "未执行进一步的文件操作。已打开的官方卸载程序不会被强制关闭。")
-            : "已经执行的步骤记录在下方日志中。你可以关闭任务后重新选择软件，或改用“仅清理残留”。"}</p>
-          <div class="job-actions"><button class="btn btn-ghost" data-act="close-job" type="button">关闭任务</button></div>
+            : canFallback
+              ? "官方卸载程序无法启动。可以直接改为仅清理残留：只会重新扫描关联文件和失效的安装登记，不会自动删除任何内容，确认后才会清理。"
+              : "已经执行的步骤记录在下方日志中。你可以关闭任务后重新选择软件，或改用“仅清理残留”。"}</p>
+          <div class="job-actions">
+            <button class="btn btn-ghost" data-act="close-job" type="button">关闭任务</button>
+            ${canFallback ? `<button class="btn btn-primary" data-act="fallback-force" type="button">${icon("i-scan")}改为仅清理残留</button>` : ""}
+          </div>
           ${jobLogs(job, true)}
         </div>`;
     } else {
@@ -1454,6 +1553,32 @@
       });
       return;
     }
+    if (act === "fallback-force") {
+      openSimpleModal({
+        title: "改为仅清理残留",
+        subtitle: "不会自动删除任何文件",
+        body: `<p class="confirm-warning">官方卸载程序无法启动。改为仅清理残留后会重新扫描安装目录、AppData、快捷方式和卸载注册项；所有内容仍需要你逐项确认后才会清理。</p>`,
+        confirm: "开始扫描残留",
+        onConfirm: async () => {
+          try {
+            const result = await api(`/api/jobs/${encodeURIComponent(job.id)}/fallback`, {
+              method: "POST",
+              body: {},
+            });
+            if (result.job) state.job = result.job;
+            state.jobRenderSig = null;
+            closeSimpleModal();
+            renderJobModal();
+            schedule(500);
+            return "handled";
+          } catch (err) {
+            if (!err.handled) toast(err.message || "无法改为仅清理残留", "error");
+            return false;
+          }
+        },
+      });
+      return;
+    }
     if (act === "select-all" || act === "select-none" || act === "select-default") {
       const items = (job.leftover && job.leftover.items) || [];
       if (act === "select-all") state.jobSelection = new Set(items.map((item) => item.id));
@@ -1536,7 +1661,7 @@
         ${jobAvatar(job, "app-avatar history-avatar")}
         <span class="history-main">
           <div class="history-name">${esc(job.app_name || "未命名任务")}</div>
-          <div class="history-sub">${dateTimeText(job.created_at)} · ${job.mode === "force" ? "仅清理残留" : "官方卸载 + 清理"}</div>
+          <div class="history-sub">${dateTimeText(job.created_at)} · ${jobModeLabel(job)}</div>
         </span>
         <span class="status-pill ${cls} history-badge">${esc(label)}</span>
         <span class="row-arrow">${icon("i-chevron")}</span>

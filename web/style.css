@@ -352,7 +352,19 @@ svg { display: block; }
 .app-location {
   min-width: 0; color: var(--muted); font-size: 11.5px;
   font-family: var(--mono);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: flex; align-items: center; gap: 6px;
+  white-space: nowrap; overflow: hidden;
+}
+.app-location .loc-path {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.app-location .loc-flag {
+  flex: none; padding: 1px 5px; border-radius: 4px;
+  border: 1px solid #f0e0bd; background: #f8f1e0; color: #8a6a2f;
+  font: 600 9.5px var(--font); letter-spacing: .01em;
+}
+.app-location .loc-flag.is-stale {
+  border-color: #f1d2c9; background: #fbeeea; color: #9a4a3c;
 }
 .app-location.is-empty { color: var(--faint); font-family: var(--font); }
 .app-kind { color: #56645c; font-size: 12px; }

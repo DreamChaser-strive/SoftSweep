@@ -25,7 +25,7 @@ from core import winutil as wu
 from core.jobs import JOBS
 from core.scanner import SCANNER
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 INSTANCE_MUTEX_NAME = "Local\\SoftSweep.SingleInstance.9D4A2B6F"
 ERROR_ALREADY_EXISTS = 183
 WEB_DIR = wu.APP_DIR / "web"
@@ -55,7 +55,7 @@ class AppServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SoftSweep/1.2.2"
+    server_version = "SoftSweep/1.2.3"
     sys_version = ""
 
     # ------------------------------------------------------------- utilities
@@ -300,6 +300,13 @@ class Handler(BaseHTTPRequestHandler):
                         self._error(HTTPStatus.CONFLICT, "任务已结束")
                         return
                     self._json(HTTPStatus.OK, {"ok": True, "job": job.snapshot(include_leftover=False)})
+                    return
+                if action == "fallback":
+                    result = JOBS.fallback(job)
+                    if not result.get("ok"):
+                        self._error(HTTPStatus.CONFLICT, result.get("error") or "无法改为仅清理残留")
+                        return
+                    self._json(HTTPStatus.OK, result)
                     return
                 if action == "cleanup":
                     item_ids = data.get("item_ids") or []

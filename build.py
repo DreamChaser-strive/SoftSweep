@@ -19,7 +19,7 @@ BUILD = ROOT / "build"
 RELEASE = ROOT / "release"
 STAGE = RELEASE / "SoftSweep-win-x64"
 APP_NAME = "SoftSweep"
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 
 def run(command: list[str]) -> None:

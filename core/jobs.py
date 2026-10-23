@@ -152,7 +152,15 @@ class Job:
         self.id = "j" + uuid.uuid4().hex[:16]
         self.app = copy.deepcopy(app)
         self.confirm_name = str(self.app.get("name") or "")
+        # A registration whose install folder and uninstaller are both absent
+        # cannot use the official uninstall flow. Start directly with the
+        # audited leftover scan instead of failing on a dead command.
+        self.fallback_used = bool(mode == "uninstall" and app.get("stale_registration"))
+        if self.fallback_used:
+            mode = "force"
         self.mode = mode
+        self.fallback_available = False
+        self.stale_registration = bool(app.get("stale_registration"))
         self.jobs = jobs
         self.lock = threading.RLock()
         self.cancel_event = threading.Event()
@@ -221,6 +229,11 @@ class Job:
                 "launched": self.launched,
                 "elevated": self.elevated,
                 "pid": self.pid,
+                "can_fallback": bool(
+                    self.fallback_available and self.status == "failed"
+                ),
+                "fallback_used": bool(self.fallback_used),
+                "stale_registration": bool(self.stale_registration),
                 "still_installed": self.still_installed,
                 "installed_check": self.installed_check,
                 "cleanup": self.cleanup_result,
@@ -302,6 +315,19 @@ class Job:
         job.pid = data.get("pid") if isinstance(data.get("pid"), int) else None
         job.elevated = bool(data.get("elevated"))
         job.launched = bool(data.get("launched"))
+        job.fallback_used = bool(data.get("fallback_used"))
+        job.stale_registration = bool(data.get("stale_registration"))
+        # Snapshots written by older builds did not carry fallback_available.
+        # A failed uninstall that never launched can still be recovered by
+        # scanning leftovers, so expose that action for existing jobs too.
+        job.fallback_available = bool(data.get("fallback_available")) or bool(
+            job.status == "failed"
+            and job.mode == "uninstall"
+            and not job.launched
+            and not job.leftover
+            and job.app.get("kind") == "registry"
+            and not job.app.get("protected")
+        )
         report_path = data.get("report_path")
         job.report_path = report_path if isinstance(report_path, str) and report_path else None
         return job
@@ -316,18 +342,44 @@ class Job:
                 self._cancelled()
                 return
             if self.mode == "force":
-                self._set("scanning", "正在扫描软件残留", "强制清理模式：不会启动官方卸载程序")
-                self._log("强制清理模式：跳过官方卸载程序", "warn")
+                if self.stale_registration:
+                    self._set(
+                        "scanning", "正在扫描失效登记与残留",
+                        "安装目录与卸载程序均不存在；只扫描，确认后才会清理",
+                    )
+                    self._log("安装目录与卸载程序均不存在：跳过官方卸载，直接清理失效登记与残留", "warn")
+                elif self.fallback_used:
+                    self._set(
+                        "scanning", "官方卸载程序不可用，正在扫描残留",
+                        "将列出可清理的残留；只有你确认后才会删除",
+                    )
+                    self._log("官方卸载程序不可用：跳过官方卸载，改为扫描残留", "warn")
+                else:
+                    self._set("scanning", "正在扫描软件残留", "强制清理模式：不会启动官方卸载程序")
+                    self._log("强制清理模式：跳过官方卸载程序", "warn")
                 self._scan_after_uninstall(force=True)
             else:
-                if not self._launch_uninstaller():
-                    self._fail("无法启动卸载程序")
+                if self._uninstaller_missing():
+                    self.mode = "force"
+                    self.fallback_used = True
+                    self.stale_registration = self._registration_is_stale()
+                    command = _normalize_uninstall_command(self.app.get("uninstall_string") or "")
+                    self._log("未找到官方卸载程序：" + (command or "（未登记卸载命令）"), "warn")
+                    self._log("已自动改为仅清理残留；不会自动删除任何文件", "warn")
+                    self._set(
+                        "scanning", "官方卸载程序不可用，正在扫描残留",
+                        "将列出可清理的残留与失效登记；只有你确认后才会删除",
+                    )
+                    self._scan_after_uninstall(force=True)
+                elif not self._launch_uninstaller():
+                    self._fail("无法启动卸载程序", fallback=True)
                     return
-                self._wait_for_uninstall()
-                if self.cancel_event.is_set():
-                    self._cancelled()
-                    return
-                self._scan_after_uninstall(force=False)
+                else:
+                    self._wait_for_uninstall()
+                    if self.cancel_event.is_set():
+                        self._cancelled()
+                        return
+                    self._scan_after_uninstall(force=False)
             if self.cancel_event.is_set():
                 self._cancelled()
                 return
@@ -336,6 +388,81 @@ class Job:
             traceback.print_exc()
             self._log(f"任务异常：{exc}", "error")
             self._fail(f"任务异常：{exc}")
+
+    def _install_folder_exists(self) -> bool:
+        location = self.app.get("install_location") or ""
+        return bool(location and os.path.isdir(location))
+
+    def _uninstaller_missing(self) -> bool:
+        if self.app.get("kind") == "uwp":
+            return False
+        command = _normalize_uninstall_command(self.app.get("uninstall_string") or "")
+        if not command:
+            return True
+        exe = wu.command_executable(command)
+        if not exe:
+            return True
+        if not os.path.isabs(exe):
+            # A bare command such as msiexec is resolved through PATH.
+            return False
+        return not os.path.isfile(exe)
+
+    def _registration_is_stale(self) -> bool:
+        """Both the install folder and the uninstaller are gone."""
+        if self.app.get("kind") != "registry" or self.app.get("protected"):
+            return False
+        return not self._install_folder_exists() and self._uninstaller_missing()
+
+    def _apply_still_installed_defaults(self, leftover: dict) -> None:
+        """Adjust defaults when the registry entry still exists after scanning.
+
+        A live install is never preselected. A stale registration (no folder,
+        no uninstaller) may be removed from the installed list, but only the
+        registration key is preselected; user data still needs a manual look.
+        """
+        if not self.still_installed:
+            return
+        if self.stale_registration:
+            keys = {
+                str(key).casefold()
+                for key in (self.app.get("uninstall_keys") or [self.app.get("uninstall_key")])
+                if key
+            }
+            # Removing the dead registration is enough to stop listing the app.
+            # Never preselect user data or shortcuts: those may still be wanted.
+            for item in leftover.get("items", []):
+                item["default_selected"] = False
+            for item in leftover.get("items", []):
+                if (item.get("kind") == "registry"
+                        and str(item.get("path") or "").casefold() in keys):
+                    item["default_selected"] = True
+                    item["risk"] = "caution"
+                    item["note"] = (
+                        "失效的卸载登记：安装目录和卸载程序都不存在；"
+                        "删除前会自动导出 .reg 备份"
+                    )
+            leftover["selected_bytes"] = 0
+            leftover.setdefault("notice", []).append(
+                "安装目录与卸载程序均不存在，这是一条失效的卸载登记；"
+                "卸载注册项已默认勾选，用户数据和快捷方式请自行确认"
+            )
+            return
+        for item in leftover.get("items", []):
+            item["default_selected"] = False
+            if item.get("section") == "install":
+                item["risk"] = "high"
+                item["note"] = (
+                    "仅清理残留模式下默认不勾选；请确认该目录已不再需要"
+                    if self.mode == "force"
+                    else "软件似乎仍处于已安装状态，默认不勾选；请先确认卸载已完成"
+                )
+        leftover["selected_bytes"] = 0
+        leftover.setdefault("notice", []).append(
+            "“仅清理残留”模式不会移除卸载注册项，软件仍会出现在已安装列表中；"
+            "为避免误删，所有项目默认未勾选"
+            if self.mode == "force"
+            else "检测到软件仍在已安装列表中：已默认取消所有勾选，避免破坏正在使用的软件"
+        )
 
     def _launch_uninstaller(self) -> bool:
         app = self.app
@@ -435,13 +562,18 @@ class Job:
                 still = candidate
                 break
         self.still_installed = bool(still)
+        self.stale_registration = bool(still) and self._registration_is_stale()
         self.installed_check = {
             "checked_at": _now_text(),
             "still_installed": bool(still),
+            "stale_registration": self.stale_registration,
             "match": (still or {}).get("name", ""),
             "notice": notices[:3],
         }
-        if still:
+        if self.stale_registration:
+            self._log("安装目录与卸载程序均不存在：这是失效的安装登记", "warn")
+            self._set(message="未找到安装文件；可勾选卸载注册项移除这条失效登记")
+        elif still:
             self._log(f"软件仍在已安装列表中：{still.get('name')}", "warn")
             if not force and not self.recheck_event.is_set():
                 self._set(message="官方卸载可能未完成；仍可手动选择残留文件，但请谨慎")
@@ -459,22 +591,7 @@ class Job:
                 "notice": [f"扫描关联文件失败：{exc}"], "scanned_at": time.time(),
                 "duration": 0, "is_admin": wu.is_admin(),
             }
-        if self.still_installed:
-            for item in leftover.get("items", []):
-                item["default_selected"] = False
-                if item.get("section") == "install":
-                    item["risk"] = "high"
-                    item["note"] = (
-                        "仅清理残留模式下默认不勾选；请确认该目录已不再需要"
-                        if self.mode == "force"
-                        else "软件似乎仍处于已安装状态，默认不勾选；请先确认卸载已完成"
-                    )
-            leftover["selected_bytes"] = 0
-            leftover.setdefault("notice", []).append(
-                "“仅清理残留”模式不会移除卸载注册项，软件仍会出现在已安装列表中；为避免误删，所有项目默认未勾选"
-                if self.mode == "force"
-                else "检测到软件仍在已安装列表中：已默认取消所有勾选，避免破坏正在使用的软件"
-            )
+        self._apply_still_installed_defaults(leftover)
         self.leftover = leftover
         self._set("awaiting_cleanup", "请确认要清理的残留文件",
                   "已扫描完成，确认后才会删除任何文件" if leftover.get("items")
@@ -502,23 +619,9 @@ class Job:
             self._set("scanning", "正在重新扫描残留")
             fresh, _ = _fresh_scan()
             self.still_installed = any(_same_app(self.app, c) for c in fresh)
+            self.stale_registration = bool(self.still_installed) and self._registration_is_stale()
             leftover = discover_leftovers(self.app, fresh)
-            if self.still_installed:
-                for item in leftover.get("items", []):
-                    item["default_selected"] = False
-                    if item.get("section") == "install":
-                        item["risk"] = "high"
-                        item["note"] = (
-                            "仅清理残留模式下默认不勾选；请确认该目录已不再需要"
-                            if self.mode == "force"
-                            else "软件似乎仍处于已安装状态，默认不勾选"
-                        )
-                leftover["selected_bytes"] = 0
-                leftover.setdefault("notice", []).append(
-                    "“仅清理残留”模式不会移除卸载注册项，软件仍会出现在已安装列表中；所有项目默认未勾选"
-                    if self.mode == "force"
-                    else "软件仍在已安装列表中：已默认取消所有勾选"
-                )
+            self._apply_still_installed_defaults(leftover)
             self.leftover = leftover
             if self.cancel_event.is_set():
                 self._cancelled()
@@ -559,6 +662,12 @@ class Job:
         self._persist()
         backup_dir = wu.BACKUP_DIR / self.id
         backup_dir.mkdir(parents=True, exist_ok=True)
+        uninstall_keys = {
+            str(key).casefold()
+            for key in (self.app.get("uninstall_keys") or [self.app.get("uninstall_key")])
+            if key
+        }
+        removed_registration = False
         results = []
         removed = 0
         failed = 0
@@ -601,6 +710,8 @@ class Job:
             if ok:
                 size = item.get("bytes") or 0
                 removed += size
+                if kind == "registry" and path.casefold() in uninstall_keys:
+                    removed_registration = True
             else:
                 failed += 1
             results.append({
@@ -616,15 +727,20 @@ class Job:
                 + ("" if ok else f"（{result.get('error')}）"),
                 "info" if ok else "error",
             )
+        if removed_registration:
+            self.still_installed = False
+            self.stale_registration = False
         self.cleanup_result = {
             "items": results,
             "removed_bytes": removed,
             "failed": failed,
             "total": len(results),
             "permanent": permanent,
+            "registration_removed": removed_registration,
             "backup_dir": str(backup_dir) if any(r.get("backup") for r in results) else "",
         }
         self._finish()
+        self.jobs.refresh_main_scan()
         return {"ok": True, "cleanup": self.cleanup_result}
 
     def cancel(self) -> bool:
@@ -653,14 +769,48 @@ class Job:
         self._persist()
         self.jobs._clear_active(self)
 
-    def _fail(self, message: str):
+    def _fail(self, message: str, *, fallback: bool = False):
         if self.status in FINAL_STATUSES:
             return
+        self.fallback_available = bool(
+            fallback
+            and self.mode == "uninstall"
+            and self.app.get("kind") == "registry"
+            and not self.app.get("protected")
+            and not self.launched
+        )
         self._set("failed", "任务失败", message)
         self.finished_at = time.time()
         self._write_report()
         self._persist()
         self.jobs._clear_active(self)
+
+    def prepare_fallback(self) -> bool:
+        """Turn a failed uninstall into an audited leftover-scan job."""
+        with self.lock:
+            if (self.status != "failed" or not self.fallback_available
+                    or self.mode != "uninstall"
+                    or self.app.get("kind") != "registry"
+                    or self.app.get("protected")):
+                return False
+            self.mode = "force"
+            self.fallback_used = True
+            self.fallback_available = False
+            self.stale_registration = False
+            self.status = "starting"
+            self.phase = "正在准备仅清理残留"
+            self.message = "官方卸载程序未能启动；将重新扫描残留，确认后才会清理"
+            self.finished_at = None
+            self.still_installed = None
+            self.installed_check = None
+            self.leftover = None
+            self.cleanup_result = None
+            self.report_path = None
+            self.cancel_event.clear()
+            self.recheck_event.clear()
+            self._log("已改为仅清理残留模式；不会自动删除任何文件", "warn")
+            self.updated_at = time.time()
+            return True
 
     def _finish(self):
         with self.lock:
@@ -690,7 +840,11 @@ class Job:
                 f"软件：{self.app.get('name')}",
                 f"版本：{self.app.get('version') or '—'}",
                 f"发布商：{self.app.get('publisher') or '—'}",
-                f"任务模式：{'强制清理' if self.mode == 'force' else '官方卸载 + 深度清理'}",
+                "任务模式：" + (
+                    "官方卸载不可用 → 仅清理残留" if self.fallback_used
+                    else "强制清理" if self.mode == "force"
+                    else "官方卸载 + 深度清理"
+                ),
                 f"状态：{STATUS_LABELS.get(self.status, self.status)}",
                 f"开始时间：{datetime.fromtimestamp(self.created_at):%Y-%m-%d %H:%M:%S}",
                 f"结束时间：{datetime.fromtimestamp(self.finished_at):%Y-%m-%d %H:%M:%S}" if self.finished_at else "结束时间：—",
@@ -763,6 +917,21 @@ class JobsManager:
                     return {"ok": False, "error": "已有清理任务正在进行，请等待完成"}
             job = Job(app, mode, self)
             self.jobs[job.id] = job
+            self.active_id = job.id
+        job.start()
+        return {"ok": True, "job": job.snapshot(include_leftover=False)}
+
+    def fallback(self, job: Job) -> dict:
+        """Recover a failed uninstall by scanning leftovers in the same job."""
+        with self.lock:
+            if self.jobs.get(job.id) is not job:
+                return {"ok": False, "error": "任务不存在"}
+            if self.active_id:
+                current = self.jobs.get(self.active_id)
+                if current and current.active:
+                    return {"ok": False, "error": "已有清理任务正在进行，请等待完成"}
+            if not job.prepare_fallback():
+                return {"ok": False, "error": "当前任务无法改为仅清理残留"}
             self.active_id = job.id
         job.start()
         return {"ok": True, "job": job.snapshot(include_leftover=False)}

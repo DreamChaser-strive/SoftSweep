@@ -769,6 +769,17 @@ def scan_registry_apps() -> tuple[list[dict], list[str]]:
     return apps, warnings
 
 
+def _uninstaller_available(command: str) -> bool:
+    """Whether the registered uninstall command points at an existing file."""
+    exe = command_executable(command or "")
+    if not exe:
+        return False
+    if not os.path.isabs(exe):
+        # A bare system command (msiexec, cmd, ...) is resolved through PATH.
+        return True
+    return os.path.isfile(exe)
+
+
 def _build_registry_app(raw: dict) -> dict:
     name = raw["name"]
     publisher = raw["publisher"]
@@ -816,8 +827,14 @@ def _build_registry_app(raw: dict) -> dict:
         # MSI maintenance can remove the product. Keep the original command.
         pass
     exists = bool(location and os.path.isdir(location))
-    if location and not exists:
+    uninstaller_available = _uninstaller_available(uninstall)
+    stale_registration = bool(not protected and not exists and not uninstaller_available)
+    if location and not exists and not uninstaller_available:
+        warnings.append("安装目录与卸载程序均已不存在，这是失效的安装登记；可直接清理登记与残留")
+    elif location and not exists:
         warnings.append("注册表中记录的安装目录当前不存在")
+    elif exists and uninstall and not uninstaller_available:
+        warnings.append("注册的卸载程序文件不存在；可改为仅清理残留或修复软件")
     aliases = app_aliases(name, publisher)
     probe_folder = "" if (protected or exists) else _inferred_program_folder(raw, aliases)
     category_info = CATEGORY_MAP.get(category, CATEGORY_MAP["other"])
@@ -862,6 +879,8 @@ def _build_registry_app(raw: dict) -> dict:
         "warnings": warnings,
         "can_uninstall": bool(uninstall) and not no_remove and not protected,
         "can_force": not protected and not no_remove,
+        "uninstaller_available": uninstaller_available,
+        "stale_registration": stale_registration,
         "uninstall_kind": "registry",
         "requires_admin": raw["uninstall_key"].startswith("HKLM") or (
             bool(location) and any(
@@ -1013,6 +1032,8 @@ $out | ConvertTo-Json -Compress -Depth 4
             "warnings": warnings_list,
             "can_uninstall": not protected,
             "can_force": not protected,
+            "uninstaller_available": True,
+            "stale_registration": False,
             "uninstall_kind": "uwp",
             "requires_admin": False,
             "size": {

@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from core import icons  # noqa: E402
 from core import jobs as job_engine  # noqa: E402
+from core import leftovers as leftover_engine  # noqa: E402
 from core import scanner as scan_engine  # noqa: E402
 from core import winutil as wu  # noqa: E402
 
@@ -331,6 +332,145 @@ def test_cleanup_confirm_frontend() -> None:
     check("retryInput.value = confirmName" in block, "请求失败后保留用户已输入的名称")
 
 
+def test_location_display_frontend() -> None:
+    """An audited size probe must not be presented as an unknown location."""
+    source = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    check("function appLocationInfo" in source, "前端统一解析安装位置")
+    check("app.size_probe_path" in source, "推断目录参与安装位置展示")
+    check("未登记安装位置" not in source, "不再显示误导性的“未登记安装位置”")
+    check("程序所在目录（推断）" in source, "详情页明确标注推断目录")
+    start = source.index("function appLocationInfo")
+    end = source.index("function appRow", start)
+    block = source[start:end]
+    check("inferred: true" in block, "有推断目录时标记为推断")
+    check("stale: true" in block, "注册目录失效时单独标记")
+    check("loc-flag" in source, "列表用标签区分推断与失效")
+    check("不会启动官方卸载程序，清理前仍会再次扫描" in source,
+          "失效登记的确认弹窗明确说明不会启动官方卸载程序")
+    check('stale ? "清理失效登记与残留"' in source,
+          "失效登记的确认弹窗使用对应标题")
+    check("!(job.stale_registration" in source,
+          "失效登记提示不会在清理页重复显示")
+
+
+def test_stale_registration_and_fallback() -> None:
+    """Missing uninstallers must lead to an audited leftover scan, never a dead end."""
+    missing_exe = TEST_ROOT / "missing_uninstaller" / "Uninstall.exe"
+    installed = TEST_ROOT / "installed_app"
+    installed.mkdir(parents=True, exist_ok=False)
+    stale_key = (
+        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        r"\SoftSweep Self Test"
+    )
+    base_app = {
+        "id": "a0123456789abcde",
+        "kind": "registry",
+        "name": "SoftSweep Fallback Test",
+        "version": "1.0",
+        "publisher": "SoftSweep",
+        "install_location": str(TEST_ROOT / "gone_app"),
+        "uninstall_string": str(missing_exe),
+        "uninstall_keys": [stale_key],
+        "uninstall_key": stale_key,
+        "protected": False,
+        "can_uninstall": True,
+    }
+    manager = job_engine.JobsManager(TEST_ROOT / "fallback-state")
+
+    check(not scan_engine._uninstaller_available(str(missing_exe)),
+          "缺失的卸载程序被识别")
+    check(scan_engine._uninstaller_available("msiexec /X{00000000-0000-0000-0000-000000000000}"),
+          "系统卸载命令不会被误判为缺失")
+    check(scan_engine._uninstaller_available(sys.executable), "存在的卸载程序可被识别")
+
+    stale_app = dict(base_app, stale_registration=True)
+    stale_job = job_engine.Job(stale_app, "uninstall", manager)
+    check(stale_job.mode == "force" and stale_job.fallback_used,
+          "失效登记跳过官方卸载，直接扫描残留")
+    check(stale_job._registration_is_stale(), "安装目录与卸载程序均缺失时判定为失效")
+    check(stale_job._uninstaller_missing(), "失效登记没有可用的卸载程序")
+
+    live_app = dict(base_app, install_location=str(installed), stale_registration=False)
+    live_job = job_engine.Job(live_app, "uninstall", manager)
+    check(live_job.mode == "uninstall", "安装目录仍存在时保留官方卸载流程")
+    check(not live_job._registration_is_stale(), "安装目录存在时不会判为失效")
+    check(live_job._uninstaller_missing(), "目录存在但卸载程序缺失可被识别")
+
+    fixture = {
+        "items": [
+            {"id": "reg", "kind": "registry", "section": "registry",
+             "path": stale_key, "bytes": None, "default_selected": False},
+            {"id": "data", "kind": "dir", "section": "userdata",
+             "path": str(TEST_ROOT), "bytes": 123, "default_selected": True},
+        ],
+        "selected_bytes": 123,
+        "notice": [],
+    }
+    stale_job.still_installed = True
+    stale_job.stale_registration = True
+    stale_job._apply_still_installed_defaults(fixture)
+    check(fixture["items"][0]["default_selected"] is True,
+          "失效登记默认勾选卸载注册项")
+    check(fixture["items"][1]["default_selected"] is False,
+          "失效登记不默认勾选用户数据", str(fixture["items"][1]))
+    check(fixture["selected_bytes"] == 0,
+          "失效登记默认只清理注册项，不预选任何文件", str(fixture["selected_bytes"]))
+    check("失效的卸载登记" in fixture["items"][0]["note"],
+          "失效登记的项目说明清楚")
+    check(any("失效的卸载登记" in n for n in fixture["notice"]),
+          "失效登记给出明确提示")
+
+    live_fixture = {
+        "items": [
+            {"id": "reg2", "kind": "registry", "section": "registry",
+             "path": stale_key, "bytes": None, "default_selected": True},
+            {"id": "data2", "kind": "dir", "section": "userdata",
+             "path": str(TEST_ROOT), "bytes": 123, "default_selected": True},
+        ],
+        "selected_bytes": 123,
+        "notice": [],
+    }
+    live_job.still_installed = True
+    live_job.stale_registration = False
+    live_job._apply_still_installed_defaults(live_fixture)
+    check(not any(i["default_selected"] for i in live_fixture["items"]),
+          "仍安装的软件在强制清理时全部默认不勾选")
+    check(live_fixture["selected_bytes"] == 0, "仍安装的软件默认选中量为零")
+
+    failed = job_engine.Job(live_app, "uninstall", manager)
+    failed.status = "failed"
+    failed.launched = False
+    failed.leftover = None
+    failed.fallback_available = True
+    manager.jobs[failed.id] = failed
+    started = []
+    failed.start = lambda: started.append(True)  # type: ignore[method-assign]
+    result = manager.fallback(failed)
+    check(result.get("ok") and failed.mode == "force" and failed.status == "starting",
+          "失败任务可以一键改为仅清理残留", str(result))
+    check(manager.active_id == failed.id and started == [True],
+          "改为残留清理后重新登记为活动任务")
+
+    old_job = job_engine.Job(live_app, "uninstall", manager)
+    old_job.status = "failed"
+    old_job.launched = False
+    old_job.leftover = None
+    old_job.fallback_available = False
+    snapshot = old_job.snapshot()
+    snapshot["fallback_available"] = False
+    restored = job_engine.Job.from_snapshot(snapshot, manager)
+    check(bool(restored) and restored.fallback_available,
+          "旧版失败任务恢复后仍提供仅清理残留入口")
+
+    community_aliases = leftover_engine._extra_aliases(
+        "IntelliJ IDEA Community Edition 2024.3.4.1"
+    )
+    check("ideaic" in community_aliases, "IntelliJ 社区版可匹配 IdeaIC 数据目录")
+    ultimate_aliases = leftover_engine._extra_aliases("IntelliJ IDEA Ultimate 2024.3")
+    check("intellijidea" in ultimate_aliases and "ideaic" not in ultimate_aliases,
+          "IntelliJ 旗舰版不会误匹配社区版数据目录")
+
+
 class _VersionProbeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -521,6 +661,8 @@ def main() -> int:
         test_job_cleanup_and_recovery()
         test_name_confirmation()
         test_cleanup_confirm_frontend()
+        test_location_display_frontend()
+        test_stale_registration_and_fallback()
         test_instance_handover()
         test_store_app_size_and_publisher()
         test_size_probe_safety()

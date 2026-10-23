@@ -87,6 +87,8 @@ _EXTRA_ALIASES = [
     (("火绒", "huorong"), ["huorong"]),
     (("钉钉",), ["dingtalk"]),
     (("学习通", "chaoxing"), ["chaoxing"]),
+    (("intellij idea community", "intellij idea ce"), ["ideaic"]),
+    (("intellij idea ultimate",), ["intellijidea"]),
 ]
 
 _REGISTRY_BLOCK = {

@@ -369,6 +369,10 @@ def match_folder_to_app(folder_name: str, aliases: set[str]) -> int:
     for alias in aliases:
         if len(alias) >= 5 and c.startswith(alias):
             tail = c[len(alias):]
+            # Version suffixes are common in data folders (IdeaIC2024.3,
+            # Python311, ...). A pure digit tail still names the same product.
+            if tail.isdigit():
+                return 2
             if tail in {"files", "file", "data", "cache", "app", "application", "client",
                         "desktop", "config", "settings", "userdata", "user", "profile"}:
                 return 1
